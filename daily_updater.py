@@ -86,6 +86,23 @@ CASHBACK_SOURCES = [
 ]
 
 
+
+GEMINI_MODELS = ["gemini-3.0-flash", "gemini-3-flash-preview", "gemini-2.5-flash-lite"]
+
+
+def gemini_generate(client, contents):
+    last_err = None
+    for model_name in GEMINI_MODELS:
+        try:
+            return client.models.generate_content(model=model_name, contents=contents)
+        except Exception as exc:
+            last_err = exc
+            if "404" in str(exc) or "NOT_FOUND" in str(exc):
+                continue
+            raise
+    raise last_err
+
+
 def fetch_html(url: str, timeout: int = 16) -> str:
     try:
         r = requests.get(url, headers=HEADERS, timeout=timeout)
@@ -285,7 +302,7 @@ def scrape_facebook_via_apify(token: str, socials: dict) -> tuple[list[dict], li
     for market, links in socials.items():
         fb = links.get("fb")
         if fb and "facebook.com/" in fb:
-            fb_urls.append({"url": fb})
+            fb_urls.append(fb)
 
     if not fb_urls:
         return [], []
@@ -293,7 +310,7 @@ def scrape_facebook_via_apify(token: str, socials: dict) -> tuple[list[dict], li
     print(f"  [Apify Facebook] {len(fb_urls)} rəsmi səhifə yoxlanılır (hərəsindən son 3 paylaşım)...")
     endpoint = f"https://api.apify.com/v2/acts/automly~facebook-page-posts-scraper/run-sync-get-dataset-items?token={token}"
     payload = {
-        "startUrls": fb_urls[:10],
+        "pages": fb_urls[:10],
         "maxPosts": 3,
     }
     blocks = []
@@ -367,7 +384,7 @@ def extract_from_promo_images_vision(client, candidates: list[dict]) -> list[dic
                 '[{"name": "...", "category": "Ərzaq", "oldPrice": 3.5, "price": 2.49, "unit": "1 ədəd"}]. '
                 "Əgər qiymət yoxdursa [] qaytar."
             )
-            resp = client.models.generate_content(model="gemini-2.5-flash", contents=[prompt, part])
+            resp = gemini_generate(client, [prompt, part])
             for item in extract_json_array(resp.text):
                 if item.get("name") and item.get("price"):
                     item["market"] = cand["market"]
@@ -416,7 +433,7 @@ def analyze_discounts_with_gemini(client, raw_blocks: list[dict], vision_items: 
         + json.dumps(payload, ensure_ascii=False)[:32000]
     )
     try:
-        resp = client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
+        resp = gemini_generate(client, prompt)
         items = extract_json_array(resp.text)
     except Exception as exc:
         print(f"Gemini endirim xətası: {exc}")
@@ -499,7 +516,7 @@ def analyze_cashbacks_with_gemini(client) -> list[dict]:
         + json.dumps(raw_banks, ensure_ascii=False)[:24000]
     )
     try:
-        resp = client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
+        resp = gemini_generate(client, prompt)
         cards = extract_json_array(resp.text)
         valid = [c for c in cards if c.get("bank") and c.get("cardName") and c.get("rate") is not None]
         valid.sort(key=lambda x: float(x.get("rate", 0)), reverse=True)
