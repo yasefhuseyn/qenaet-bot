@@ -88,6 +88,11 @@ MIN_PRICE, MAX_PRICE = 0.05, 300.0
 GEMINI_BATCH_CHARS = 22000
 GEMINI_MAX_BATCHES = 4
 GEMINI_MIN_INTERVAL = 4.0  # saniyə (pulsuz limitə uyğun)
+LOGO_VERSION = 2           # dəyişəndə bütün loqolar yenidən yoxlanılır
+IMAGE_CACHE_VERSION = 2    # dəyişəndə köhnə (yanlış ola bilən) şəkil keşi silinir
+VERIFY_MAX = env_int("VISION_VERIFY_MAX", 30)   # axtarışla tapılan şəkilləri AI ilə yoxlama limiti
+NEG_CACHE_DAYS = 14        # uyğun şəkil tapılmayan məhsul bu müddət təkrar axtarılmır
+_verify_used = 0
 
 WATERMARK_DOMAINS = (
     "shutterstock.com", "istockphoto.com", "gettyimages.com", "alamy.com",
@@ -171,7 +176,7 @@ PRICE_RE = re.compile(r"\d+(?:[.,]\d{1,2})?\s*(?:₼|azn|man\b|manat)", re.I)
 
 GEMINI_MODELS = ["gemini-2.5-flash", "gemini-3-flash-preview", "gemini-2.5-flash-lite"]
 
-STATS = {"web_pages": 0, "structured": 0, "ig_posts": 0, "fb_posts": 0, "tg_posts": 0,
+STATS = {"image_verified": 0, "web_pages": 0, "structured": 0, "ig_posts": 0, "fb_posts": 0, "tg_posts": 0,
          "vision_images": 0, "gemini_calls": 0, "gemini_errors": 0, "image_searches": 0}
 
 
@@ -342,30 +347,148 @@ def verify_image_url(url: str, min_dim: int = 220) -> bool:
             r.close()
 
 
-def find_high_quality_product_image(product_name: str, image_cache: dict) -> str:
+def name_tokens(text: str) -> set:
+    return {t for t in re.findall(r"[a-z0-9əöüğçşı]{3,}", (text or "").lower())
+            if t not in ("the", "and", "kq", "qr", "ədədli", "edədli", "endirimli")}
+
+
+def tokens_overlap(a: str, b: str, need: int = 1) -> bool:
+    ta, tb = name_tokens(a), name_tokens(b)
+    return len(ta & tb) >= min(need, len(ta) or need)
+
+
+def extract_json_object(raw: str) -> dict:
+    m = re.search(r"\{.*\}", raw or "", re.DOTALL)
+    if not m:
+        return {}
+    try:
+        data = json.loads(m.group(0))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def vision_confirms_product(client, image_url: str, product_name: str) -> bool:
+    """Gemini şəkilə baxıb bunun həqiqətən həmin məhsulun təmiz şəkli olub-olmadığını deyir."""
+    global _verify_used
+    if client is None or types is None or _verify_used >= VERIFY_MAX:
+        return False
+    try:
+        r = SESSION.get(image_url, timeout=10)
+        if r.status_code != 200 or len(r.content) > 3_000_000:
+            return False
+        mime = (r.headers.get("Content-Type") or "image/jpeg").split(";")[0].strip().lower()
+        if mime not in ("image/jpeg", "image/png", "image/webp"):
+            return False
+        _verify_used += 1
+        STATS["image_verified"] += 1
+        prompt = (
+            f'Bu şəkil "{product_name}" məhsulunun təmiz, tək məhsul şəklidirmi? '
+            "Marka və məhsul növü uyğun olmalıdır. Şəxs, musiqiçi, oyun/film qrafikası, loqo, "
+            "bir neçə fərqli məhsulun kollajı, mətbuat/kataloq səhifəsi və ya başqa məhsul olarsa uyğun DEYİL. "
+            'YALNIZ JSON qaytar: {"match": true} və ya {"match": false}'
+        )
+        resp = gemini_text(client, [prompt, types.Part.from_bytes(data=r.content, mime_type=mime)])
+        return extract_json_object(resp).get("match") is True
+    except Exception as exc:
+        log.warning("  [Şəkil yoxlaması] %s: %s", product_name, exc)
+        return False
+
+
+def find_high_quality_product_image(product_name: str, image_cache: dict, client=None, today: str = "") -> str:
+    """İnternetdə axtarır, AMMA yalnız Gemini təsdiq etdiyi şəkli qəbul edir. Əmin deyilsə boş qaytarır."""
     key = normalize_key(product_name)
-    if image_cache.get(key):
-        return image_cache[key]
-    if DDGS is None:
+    cached = image_cache.get(key) or ""
+    if cached.startswith("https://"):
+        return cached
+    if cached.startswith("none:") and today:
+        try:
+            if (datetime.fromisoformat(today) - datetime.fromisoformat(cached[5:])).days < NEG_CACHE_DAYS:
+                return ""
+        except ValueError:
+            pass
+    if DDGS is None or client is None or _verify_used >= VERIFY_MAX:
         return ""
     STATS["image_searches"] += 1
-    for q in (f'"{product_name}"', f"{product_name} product"):
+    need = 2 if len(name_tokens(product_name)) >= 2 else 1
+    candidates = []
+    for q in (f"{product_name} Azərbaycan market", f'"{product_name}"'):
         try:
             time.sleep(0.6)
-            results = DDGS().images(q, max_results=6)
-            for item in results or []:
+            for item in DDGS().images(q, max_results=8) or []:
                 img_url = item.get("image") or ""
-                w = int(item.get("width") or 0)
-                h = int(item.get("height") or 0)
-                if w and h and (w < 250 or h < 250):
+                w, h = int(item.get("width") or 0), int(item.get("height") or 0)
+                if (w and h and (w < 250 or h < 250)) or img_url in candidates:
+                    continue
+                if not tokens_overlap(product_name, (item.get("title") or "") + " " + img_url, need):
                     continue
                 if verify_image_url(img_url, min_dim=220):
-                    image_cache[key] = img_url
-                    return img_url
+                    candidates.append(img_url)
         except Exception as exc:
             log.warning("  [Şəkil axtarış xətası] %s: %s", product_name, exc)
             break
+        if len(candidates) >= 2:
+            break
+    for img_url in candidates[:2]:
+        if vision_confirms_product(client, img_url, product_name):
+            image_cache[key] = img_url
+            return img_url
+    if today and _verify_used < VERIFY_MAX:
+        image_cache[key] = f"none:{today}"
     return ""
+
+
+def logo_ok(url: str) -> bool:
+    """Loqo kvadrata yaxın, kifayət qədər böyük və açıla bilən şəkil olmalıdır (banner/og:image deyil)."""
+    if not url or not url.startswith("https://") or url.lower().split("?")[0].endswith(".svg"):
+        return False
+    try:
+        r = SESSION.get(url, timeout=10)
+        if r.status_code != 200 or not r.content or len(r.content) > 1_500_000:
+            return False
+        im = Image.open(io.BytesIO(r.content))
+        w, h = im.size
+        return w >= 48 and h >= 48 and 0.7 <= w / float(h) <= 1.4
+    except Exception:
+        return False
+
+
+def logo_candidates(domain: str) -> list[str]:
+    base = f"https://{domain}"
+    html = fetch_html(base, timeout=10)
+    ranked = []
+    if html:
+        soup = BeautifulSoup(html, "html.parser")
+
+        def size_of(tag):
+            m = re.search(r"(\d+)x\d+", tag.get("sizes") or "")
+            return int(m.group(1)) if m else 0
+
+        for tag in soup.select('link[rel~="apple-touch-icon"], link[rel~="apple-touch-icon-precomposed"]'):
+            if tag.get("href"):
+                ranked.append((2, size_of(tag), urljoin(base, tag["href"])))
+        for tag in soup.select('link[rel~="icon"], link[rel="shortcut icon"]'):
+            if tag.get("href"):
+                ranked.append((0, size_of(tag), urljoin(base, tag["href"])))
+        man = soup.select_one('link[rel="manifest"]')
+        if man and man.get("href"):
+            try:
+                data = SESSION.get(urljoin(base, man["href"]), timeout=8).json()
+                for ic in data.get("icons", []):
+                    sz = re.search(r"(\d+)x\d+", ic.get("sizes") or "")
+                    ranked.append((1, int(sz.group(1)) if sz else 0, urljoin(urljoin(base, man["href"]), ic.get("src", ""))))
+            except Exception:
+                pass
+    ranked.sort(key=lambda x: (-x[0], -x[1]))
+    urls = [u for _, _, u in ranked]
+    urls += [f"{base}/apple-touch-icon.png", f"https://www.google.com/s2/favicons?domain={domain}&sz=128",
+             f"https://icons.duckduckgo.com/ip3/{domain}.ico"]
+    seen, out = set(), []
+    for u in urls:
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
 
 
 def collect_brand_logos(existing_logos: dict) -> dict:
@@ -377,22 +500,18 @@ def collect_brand_logos(existing_logos: dict) -> dict:
 
     def find(item):
         name, domain = item
-        found = ""
-        html = fetch_html(f"https://{domain}", timeout=10)
-        if html:
-            soup = BeautifulSoup(html, "html.parser")
-            for sel, attr in (('link[rel="apple-touch-icon"]', "href"), ('meta[property="og:image"]', "content")):
-                tag = soup.select_one(sel)
-                if tag and tag.get(attr):
-                    cand = urljoin(f"https://{domain}", tag.get(attr))
-                    if cand.startswith("https://"):
-                        found = cand
-                        break
-        return name, found or f"https://www.google.com/s2/favicons?domain={domain}&sz=128"
+        for cand in logo_candidates(domain)[:8]:
+            if logo_ok(cand):
+                return name, cand
+        return name, ""
 
     with ThreadPoolExecutor(max_workers=6) as pool:
         for name, url in pool.map(find, todo):
-            logos[name] = url
+            if url:
+                logos[name] = url
+            else:
+                logos.pop(name, None)   # yanlış loqo göstərməkdənsə, saytda baş hərflər göstərilir
+                log.warning("  [Loqo] %s üçün uyğun loqo tapılmadı", name)
     return logos
 
 
@@ -704,23 +823,26 @@ def extract_from_promo_images_vision(client, candidates: list[dict]) -> list[dic
 # --------------------------------------------------------------------------- məhsulların təhlili
 def pick_svg_type(category: str, name: str) -> str:
     low = (name + " " + category).lower()
-    if any(k in low for k in ("kərə yağ", "kere yag", "kərə", "kere")):
-        return "butter"
-    if any(k in low for k in ("qatıq", "qatiq", "yoqurt", "kefir", "ayran")):
-        return "yogurt"
-    if any(k in low for k in ("süd", "sud", "pendir")):
-        return "milk"
-    if any(k in low for k in ("yağ", "yag")):
-        return "oil"
-    if any(k in low for k in ("çay", "cay", "qəhvə", "kofe")):
-        return "tea"
-    if any(k in low for k in ("sabun", "fairy", "bulaşıq")):
-        return "soap"
-    if any(k in low for k in ("yuyucu", "ariel", "persil", "təmiz")):
-        return "detergent"
-    if any(k in low for k in ("kola", "cola", "su ", "şirə", "içki", "fanta")):
-        return "drink"
-    return "milk"
+    rules = [
+        ("paper", ("kağız", "kagiz", "salfet", "dəsmal", "desmal", "tualet", "pampers", "bez")),
+        ("butter", ("kərə yağ", "kere yag", "kərə", "kere")),
+        ("yogurt", ("qatıq", "qatiq", "yoqurt", "kefir", "ayran", "qaymaq")),
+        ("milk", ("süd", "sud", "pendir")),
+        ("oil", ("yağ", "yag")),
+        ("tea", ("çay", "cay", "qəhvə", "kofe", "nescafe")),
+        ("soap", ("sabun", "fairy", "bulaşıq", "şampun", "gel")),
+        ("detergent", ("yuyucu", "ariel", "persil", "təmiz", "tide")),
+        ("sweet", ("şokolad", "konfet", "peçenye", "vafli", "tort", "biskvit", "şirniyyat", "dondurma")),
+        ("fruit", ("alma", "armud", "banan", "pomidor", "xiyar", "kartof", "soğan", "meyvə", "tərəvəz", "limon",
+                   "portağal", "üzüm", "nar", "kök", "badımcan", "bibər")),
+        ("meat", ("ət", "toyuq", "sosis", "kolbasa", "balıq", "fileto", "kotlet")),
+        ("bread", ("çörək", "lavaş", "xəmir", "un ", "makaron", "düyü", "yarma")),
+        ("drink", ("kola", "cola", "su ", "şirə", "içki", "fanta", "limonad", "sprite", "pepsi")),
+    ]
+    for svg, kws in rules:
+        if any(k in low for k in kws):
+            return svg
+    return "bag"
 
 
 def chunk_blocks(blocks: list[dict]) -> list[list[dict]]:
@@ -793,11 +915,11 @@ def clean_item(it: dict, today: str) -> dict | None:
         "key": key, "name": name, "category": cat, "market": normalize_market(it.get("market") or ""),
         "source": clean_text(it.get("source") or "Veb sayt", 30), "price": price, "oldPrice": old,
         "unit": clean_text(it.get("unit") or "1 ədəd", 25), "imageUrl": img if img.startswith("https://") else "",
-        "endDate": end_date,
+        "endDate": end_date, "imgSrc": (it.get("imgSrc") or "") if img.startswith("https://") else "",
     }
 
 
-def build_products(raw_items: list[dict], prev_items: list[dict], image_cache: dict, today: str) -> tuple[list[dict], list[dict]]:
+def build_products(raw_items: list[dict], prev_items: list[dict], image_cache: dict, today: str, client=None) -> tuple[list[dict], list[dict]]:
     """Təmizləyir, təkrarları birləşdirir, marketlər arası müqayisə qurur, tarixçə və şəkilləri yeniləyir."""
     # 1. Təmizlə və (məhsul, market) üzrə ən ucuz təklifi saxla
     entries: dict[str, dict] = {}
@@ -828,7 +950,7 @@ def build_products(raw_items: list[dict], prev_items: list[dict], image_cache: d
                 "key": k, "name": clean_text(p.get("name")), "category": p.get("category", "Ərzaq"), "market": market,
                 "source": clean_text(p.get("source") or "Veb sayt", 30), "price": safe_float(p.get("price"), 0),
                 "oldPrice": safe_float(p.get("oldPrice"), 0) or 0, "unit": clean_text(p.get("unit") or "1 ədəd", 25),
-                "imageUrl": p.get("imageUrl") or "", "endDate": end, "carried": True,
+                "imageUrl": p.get("imageUrl") or "", "imgSrc": p.get("imgSrc") or "", "endDate": end, "carried": True,
             }
             carried += 1
     if carried:
@@ -852,14 +974,17 @@ def build_products(raw_items: list[dict], prev_items: list[dict], image_cache: d
     searched = 0
     for e in sorted(entry_list, key=lambda x: x["price"]):
         if e["imageUrl"]:
+            e["imgSrc"] = e.get("imgSrc") or "source"
             continue
         prev = prev_index.get(f"{e['key']}|{e['market']}")
-        if prev and prev.get("imageUrl"):
-            e["imageUrl"] = prev["imageUrl"]
-        elif image_cache.get(e["key"]):
-            e["imageUrl"] = image_cache[e["key"]]
+        if prev and prev.get("imageUrl") and prev.get("imgSrc") in ("source", "verified"):
+            e["imageUrl"], e["imgSrc"] = prev["imageUrl"], prev["imgSrc"]   # yalnız yoxlanmış şəkil təkrar istifadə olunur
+        elif (image_cache.get(e["key"]) or "").startswith("https://"):
+            e["imageUrl"], e["imgSrc"] = image_cache[e["key"]], "verified"
         elif searched < IMAGE_SEARCH_MAX:
-            e["imageUrl"] = find_high_quality_product_image(e["name"], image_cache)
+            url = find_high_quality_product_image(e["name"], image_cache, client, today)
+            if url:
+                e["imageUrl"], e["imgSrc"] = url, "verified"
             searched += 1
 
     # 6. Yekun siyahı
@@ -887,7 +1012,7 @@ def build_products(raw_items: list[dict], prev_items: list[dict], image_cache: d
         products.append({
             "id": "p_" + short_hash(hk),
             "name": e["name"], "category": e["category"], "market": e["market"], "source": e["source"],
-            "oldPrice": e["oldPrice"], "price": e["price"], "unit": e["unit"], "imageUrl": e["imageUrl"],
+            "oldPrice": e["oldPrice"], "price": e["price"], "unit": e["unit"], "imageUrl": e["imageUrl"], "imgSrc": e.get("imgSrc", ""),
             "endDate": e["endDate"], "svgType": pick_svg_type(e["category"], e["name"]),
             "iconBg": "from-emerald-50 to-teal-100 dark:from-emerald-950/60 dark:to-teal-900/40",
             "aiMatch": match, "comparisons": comps, "history30": hist, "histKey": hk, "histDate": today,
@@ -1071,11 +1196,14 @@ def main():
     prev_discounts = read_doc(db, "daily_discounts")
     prev_items = [p for p in prev_discounts.get("items", []) if isinstance(p, dict)]
     prev_cashback = [c for c in read_doc(db, "daily_cashback").get("items", []) if isinstance(c, dict)]
-    image_cache = dict(read_doc(db, "image_cache").get("map", {}))
-    existing_logos = dict(read_doc(db, "brand_assets").get("logos", {}))
+    cache_doc = read_doc(db, "image_cache").get("map", {})
+    image_cache = dict(cache_doc) if cache_doc.get("_v") == IMAGE_CACHE_VERSION else {}
+    image_cache["_v"] = IMAGE_CACHE_VERSION
+    assets = read_doc(db, "brand_assets")
+    existing_logos = dict(assets.get("logos", {})) if assets.get("version") == LOGO_VERSION else {}
 
     log.info("1. Market və bank loqoları yoxlanılır...")
-    write_doc(db, "brand_assets", {"updatedLabel": f"Yeniləndi: {now_label}", "logos": collect_brand_logos(existing_logos)}, dry)
+    write_doc(db, "brand_assets", {"updatedLabel": f"Yeniləndi: {now_label}", "version": LOGO_VERSION, "logos": collect_brand_logos(existing_logos)}, dry)
 
     log.info("2. Market saytları skan edilir (endirim səhifələri avtomatik tapılır)...")
     web_blocks, structured, socials, tg_channels = scrape_market_websites()
@@ -1097,10 +1225,20 @@ def main():
     vision_items = extract_from_promo_images_vision(client, ig_vision + fb_vision + tg_vision)
     text_blocks = web_blocks + ig_blocks[:40] + fb_blocks[:40] + tg_blocks
     gemini_items = gemini_extract_products(client, text_blocks) if text_blocks else []
+    # Yalnız saytda həqiqətən olan və adı məhsula uyğun gələn şəkillər qəbul edilir (Gemini şəkil uydura bilər)
+    page_images = {im["url"]: im.get("alt", "") for b in web_blocks for im in b.get("images", [])}
+    for it in structured:
+        it["imgSrc"] = "source"
+    for it in gemini_items:
+        url, alt = it.get("imageUrl"), page_images.get(it.get("imageUrl"))
+        if url in page_images and tokens_overlap(it.get("name", ""), alt or "", 1) and alt:
+            it["imgSrc"] = "source"
+        else:
+            it["imageUrl"] = ""
     raw_items = structured + vision_items + gemini_items
     log.info("  Xam məhsul: strukturlu %d + Vision %d + Gemini %d", len(structured), len(vision_items), len(gemini_items))
 
-    products, drops = build_products(raw_items, prev_items, image_cache, today)
+    products, drops = build_products(raw_items, prev_items, image_cache, today, client)
     with_img = sum(1 for p in products if p.get("imageUrl"))
     multi = sum(1 for p in products if len(p["comparisons"]) > 1)
     log.info("Yekun məhsul: %d (şəkilli: %d, çox marketdə müqayisəli: %d, qiyməti düşən: %d)", len(products), with_img, multi, len(drops))
