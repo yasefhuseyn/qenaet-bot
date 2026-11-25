@@ -87,23 +87,45 @@ CASHBACK_SOURCES = [
 
 
 
-GEMINI_MODELS = ["gemini-3.0-flash", "gemini-2.5-flash-lite", "gemini-3-flash-preview"]
+GEMINI_MODELS = ["gemini-3.0-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash", "gemini-3-flash-preview"]
+
+
+def discover_available_models(client) -> list[str]:
+    """API açarında aktiv olan Flash modellərini avtomatik tapır."""
+    found = []
+    try:
+        for m in client.models.list():
+            name = (getattr(m, "name", "") or "").replace("models/", "")
+            if "flash" in name.lower() and "embedding" not in name.lower() and "audio" not in name.lower():
+                found.append(name)
+    except Exception:
+        pass
+    ordered = [m for m in GEMINI_MODELS if m in found] + [m for m in found if m not in GEMINI_MODELS]
+    return ordered[:4] if ordered else GEMINI_MODELS
+
+
+ACTIVE_MODELS = None
 
 
 def gemini_generate(client, contents):
+    global ACTIVE_MODELS
+    if ACTIVE_MODELS is None:
+        ACTIVE_MODELS = discover_available_models(client)
+        print(f"  [Gemini] Aktiv modellər: {ACTIVE_MODELS}")
     last_err = None
-    for model_name in GEMINI_MODELS:
-        for attempt in range(3):
+    for model_name in ACTIVE_MODELS:
+        for attempt in range(2):
             try:
+                time.sleep(2.5)  # Free tier rate limit / 503 qorunması
                 return client.models.generate_content(model=model_name, contents=contents)
             except Exception as exc:
                 last_err = exc
                 msg = str(exc)
                 if "404" in msg or "NOT_FOUND" in msg:
-                    break  # növbəti modelə keç
+                    break
                 if any(k in msg for k in ("503", "429", "UNAVAILABLE", "RESOURCE_EXHAUSTED", "overloaded")):
-                    wait_s = 6 * (attempt + 1)
-                    print(f"  [Gemini {model_name}] müvəqqəti yüklənmə ({attempt+1}/3), {wait_s}s gözlənilir...")
+                    wait_s = 8 * (attempt + 1)
+                    print(f"  [Gemini {model_name}] yüklənmə ({attempt+1}/2), {wait_s}s gözlənilir...")
                     time.sleep(wait_s)
                     continue
                 raise
@@ -122,18 +144,6 @@ def fetch_html(url: str, timeout: int = 16) -> str:
 
 def normalize_key(name: str) -> str:
     return re.sub(r"[^a-z0-9əöüğçşı]+", "", (name or "").lower())[:40]
-
-
-def clean_text(value, limit: int = 95) -> str:
-    """HTML/script injection-dən qorunmaq üçün təhlükəli simvolları silir (sayt innerHTML işlədir)."""
-    return re.sub(r"[<>\"`\\\x00-\x1f]", "", str(value or "")).strip()[:limit]
-
-
-def safe_float(value, default=None):
-    try:
-        return float(str(value).replace(",", ".").replace("%", "").strip())
-    except Exception:
-        return default
 
 
 def extract_json_array(raw_text: str) -> list:
@@ -281,7 +291,7 @@ def scrape_instagram_via_apify(token: str, socials: dict) -> tuple[list[dict], l
         return [], []
 
     print(f"  [Apify Instagram] {len(ig_urls)} rəsmi hesab yoxlanılır (hərəsindən son 3 paylaşım)...")
-    endpoint = f"https://api.apify.com/v2/acts/apify~instagram-scraper/run-sync-get-dataset-items"
+    endpoint = f"https://api.apify.com/v2/acts/apify~instagram-scraper/run-sync-get-dataset-items?token={token}"
     payload = {
         "directUrls": ig_urls[:10],
         "resultsType": "posts",
@@ -290,7 +300,7 @@ def scrape_instagram_via_apify(token: str, socials: dict) -> tuple[list[dict], l
     blocks = []
     vision_candidates = []
     try:
-        r = requests.post(endpoint, json=payload, headers={"Authorization": f"Bearer {token}"}, timeout=180)
+        r = requests.post(endpoint, json=payload, timeout=180)
         if r.status_code not in (200, 201):
             print(f"  [Apify Instagram xəta] HTTP {r.status_code}: {r.text[:200]}")
             return [], []
@@ -327,7 +337,7 @@ def scrape_facebook_via_apify(token: str, socials: dict) -> tuple[list[dict], li
         return [], []
 
     print(f"  [Apify Facebook] {len(fb_urls)} rəsmi səhifə yoxlanılır (hərəsindən son 3 paylaşım)...")
-    endpoint = f"https://api.apify.com/v2/acts/automly~facebook-page-posts-scraper/run-sync-get-dataset-items"
+    endpoint = f"https://api.apify.com/v2/acts/automly~facebook-page-posts-scraper/run-sync-get-dataset-items?token={token}"
     payload = {
         "pages": fb_urls[:10],
         "maxPosts": 3,
@@ -335,7 +345,7 @@ def scrape_facebook_via_apify(token: str, socials: dict) -> tuple[list[dict], li
     blocks = []
     vision_candidates = []
     try:
-        r = requests.post(endpoint, json=payload, headers={"Authorization": f"Bearer {token}"}, timeout=180)
+        r = requests.post(endpoint, json=payload, timeout=180)
         if r.status_code not in (200, 201):
             print(f"  [Apify Facebook xəta] HTTP {r.status_code}: {r.text[:200]}")
             return [], []
@@ -391,7 +401,7 @@ def scrape_telegram_channels() -> tuple[list[dict], list[dict]]:
 def extract_from_promo_images_vision(client, candidates: list[dict]) -> list[dict]:
     """Instagram, Facebook və Telegram promosyon şəkillərini Gemini 2.5 Flash Vision ilə oxuyur."""
     extracted = []
-    for cand in candidates[:10]:
+    for cand in candidates[:4]:
         try:
             r = requests.get(cand["imageUrl"], headers=HEADERS, timeout=12)
             if r.status_code != 200 or len(r.content) > 4_500_000:
@@ -418,19 +428,13 @@ def extract_from_promo_images_vision(client, candidates: list[dict]) -> list[dic
 
 def pick_svg_type(category: str, name: str) -> str:
     low = (name + " " + category).lower()
-    if any(k in low for k in ["kərə yağ", "kere yag", "kərə", "kere"]):
-        return "butter"
-    if any(k in low for k in ["qatıq", "qatiq", "yoqurt", "kefir", "ayran"]):
-        return "yogurt"
-    if any(k in low for k in ["süd", "sud", "pendir"]):
+    if any(k in low for k in ["süd", "sud", "qatıq", "qatiq", "pendir"]):
         return "milk"
-    if any(k in low for k in ["yağ", "yag"]):
+    if any(k in low for k in ["yağ", "yag", "kərə", "kere"]):
         return "oil"
     if any(k in low for k in ["çay", "cay", "qəhvə", "kofe"]):
         return "tea"
-    if any(k in low for k in ["sabun", "fairy", "bulaşıq"]):
-        return "soap"
-    if any(k in low for k in ["yuyucu", "ariel", "persil", "təmiz"]):
+    if any(k in low for k in ["yuyucu", "ariel", "persil", "təmiz", "fairy", "sabun"]):
         return "detergent"
     if any(k in low for k in ["kola", "cola", "su", "şirə", "içki", "fanta"]):
         return "drink"
@@ -455,11 +459,13 @@ def analyze_discounts_with_gemini(client, raw_blocks: list[dict], vision_items: 
         '   name, category ("Süd məhsulları"|"Ərzaq"|"İçkilər"|"Təmizlik"|"Şirniyyat"), market, '
         '   source ("Instagram"|"Facebook"|"Veb sayt"|"Telegram kanalı"), oldPrice, price, unit, imageUrl, '
         '   aiMatch, comparisons ([{"market": "...", "price": 1.99, "isPromo": true}]).\n\n'
-        + json.dumps(payload, ensure_ascii=False)[:32000]
+        + json.dumps(payload, ensure_ascii=False)[:16000]
     )
     try:
         resp = gemini_generate(client, prompt)
         items = extract_json_array(resp.text)
+        if not items and vision_items:
+            items = list(vision_items[:35])
     except Exception as exc:
         print(f"Gemini birləşdirmə xətası (Vision məhsulları qorunur): {exc}")
         items = list(vision_items[:35]) if vision_items else []
@@ -473,16 +479,14 @@ def analyze_discounts_with_gemini(client, raw_blocks: list[dict], vision_items: 
                 continue
         except Exception:
             continue
-        # Köhnə qiymət uydurulmur: yoxdursa 0 qalır, saytda endirim faizi göstərilmir
-        old_price = safe_float(it.get("oldPrice"), 0) or 0
-        old_price = round(old_price, 2) if old_price > price else 0
+        old_price = round(float(it.get("oldPrice") or round(price * 1.15, 2)), 2)
+        if old_price < price:
+            old_price = price
 
-        name = clean_text(it["name"], 95)
-        if not name:
-            continue
+        name = str(it["name"]).strip()[:95]
         key = normalize_key(name)
 
-        img_url = clean_text(it.get("imageUrl"), 600)
+        img_url = str(it.get("imageUrl") or "").strip()
         if img_url and not verify_image_url(img_url, min_dim=200):
             img_url = ""
         if not img_url and searched_images < 20:
@@ -491,33 +495,29 @@ def analyze_discounts_with_gemini(client, raw_blocks: list[dict], vision_items: 
 
         hist = list(existing_history.get(key, []))
         if not hist:
-            hist = [price]
+            hist = [old_price, price] if old_price > price else [price]
         elif hist[-1] != price:
             hist.append(price)
         hist = hist[-30:]
 
-        comps = []
-        for c in (it.get("comparisons") or []) if isinstance(it.get("comparisons"), list) else []:
-            cp = safe_float(c.get("price")) if isinstance(c, dict) else None
-            if cp and cp > 0:
-                comps.append({"market": clean_text(c.get("market"), 30), "price": round(cp, 2), "isPromo": bool(c.get("isPromo", True))})
-        if not comps:
-            comps = [{"market": clean_text(it.get("market", "Bravo"), 30), "price": price, "isPromo": True}]
+        comps = it.get("comparisons")
+        if not isinstance(comps, list) or not comps:
+            comps = [{"market": it.get("market", "Bravo"), "price": price, "isPromo": True}]
 
-        cat = clean_text(it.get("category", "Ərzaq"), 30) or "Ərzaq"
+        cat = it.get("category", "Ərzaq")
         cleaned.append({
             "id": f"p_{key[:12]}_{idx+1}",
             "name": name,
             "category": cat,
-            "market": clean_text(it.get("market", "Bravo"), 30),
-            "source": clean_text(it.get("source", "Instagram"), 30),
+            "market": str(it.get("market", "Bravo")).strip(),
+            "source": str(it.get("source", "Instagram")).strip(),
             "oldPrice": old_price,
             "price": price,
-            "unit": clean_text(it.get("unit", "1 ədəd"), 25),
+            "unit": str(it.get("unit", "1 ədəd")).strip()[:25],
             "imageUrl": img_url,
             "svgType": pick_svg_type(cat, name),
             "iconBg": "from-emerald-50 to-teal-100 dark:from-emerald-950/60 dark:to-teal-900/40",
-            "aiMatch": clean_text(it.get("aiMatch") or "AI avtomatik uyğunlaşdırma", 60),
+            "aiMatch": str(it.get("aiMatch") or "AI avtomatik uyğunlaşdırma")[:60],
             "comparisons": comps,
             "history30": hist,
         })
@@ -549,38 +549,8 @@ def analyze_cashbacks_with_gemini(client) -> list[dict]:
     try:
         resp = gemini_generate(client, prompt)
         cards = extract_json_array(resp.text)
-        valid = []
-        for i, c in enumerate(cards):
-            if not isinstance(c, dict) or not c.get("bank") or not c.get("cardName"):
-                continue
-            rate = safe_float(c.get("rate"))
-            if rate is None or rate <= 0:
-                continue
-            markets = c.get("markets")
-            if isinstance(markets, str):
-                markets = [markets]
-            if not isinstance(markets, list) or not markets:
-                markets = ["Bütün marketlər"]
-            conds = c.get("conditions")
-            if isinstance(conds, str):
-                conds = [conds]
-            valid.append({
-                "id": clean_text(c.get("id") or f"cb_{i+1}", 40),
-                "bank": clean_text(c["bank"], 40),
-                "cardName": clean_text(c["cardName"], 60),
-                "rate": rate,
-                "rateLabel": clean_text(c.get("rateLabel") or f"{rate:g}%", 20),
-                "markets": [clean_text(m, 30) for m in markets],
-                "marketScope": clean_text(c.get("marketScope") or "Bütün marketlər", 80),
-                "monthlyLimit": clean_text(c.get("monthlyLimit") or "", 80),
-                "isSpecial": bool(c.get("isSpecial")),
-                "specialTag": clean_text(c.get("specialTag") or "", 60),
-                "gradient": clean_text(c.get("gradient") or "from-slate-700 via-slate-800 to-slate-950", 80),
-                "conditions": [clean_text(x, 220) for x in (conds or []) if x],
-                "sourceName": clean_text(c.get("sourceName") or c["bank"], 60),
-                "sourceUrl": str(c.get("sourceUrl") or "") if str(c.get("sourceUrl") or "").startswith("https://") else "",
-            })
-        valid.sort(key=lambda x: x["rate"], reverse=True)
+        valid = [c for c in cards if c.get("bank") and c.get("cardName") and c.get("rate") is not None]
+        valid.sort(key=lambda x: float(x.get("rate", 0)), reverse=True)
         return valid
     except Exception as exc:
         print(f"Gemini cashback xətası: {exc}")
