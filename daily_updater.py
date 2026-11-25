@@ -87,19 +87,26 @@ CASHBACK_SOURCES = [
 
 
 
-GEMINI_MODELS = ["gemini-3.0-flash", "gemini-3-flash-preview", "gemini-2.5-flash-lite"]
+GEMINI_MODELS = ["gemini-3.0-flash", "gemini-2.5-flash-lite", "gemini-3-flash-preview"]
 
 
 def gemini_generate(client, contents):
     last_err = None
     for model_name in GEMINI_MODELS:
-        try:
-            return client.models.generate_content(model=model_name, contents=contents)
-        except Exception as exc:
-            last_err = exc
-            if "404" in str(exc) or "NOT_FOUND" in str(exc):
-                continue
-            raise
+        for attempt in range(3):
+            try:
+                return client.models.generate_content(model=model_name, contents=contents)
+            except Exception as exc:
+                last_err = exc
+                msg = str(exc)
+                if "404" in msg or "NOT_FOUND" in msg:
+                    break  # növbəti modelə keç
+                if any(k in msg for k in ("503", "429", "UNAVAILABLE", "RESOURCE_EXHAUSTED", "overloaded")):
+                    wait_s = 6 * (attempt + 1)
+                    print(f"  [Gemini {model_name}] müvəqqəti yüklənmə ({attempt+1}/3), {wait_s}s gözlənilir...")
+                    time.sleep(wait_s)
+                    continue
+                raise
     raise last_err
 
 
@@ -436,8 +443,8 @@ def analyze_discounts_with_gemini(client, raw_blocks: list[dict], vision_items: 
         resp = gemini_generate(client, prompt)
         items = extract_json_array(resp.text)
     except Exception as exc:
-        print(f"Gemini endirim xətası: {exc}")
-        return []
+        print(f"Gemini birləşdirmə xətası (Vision məhsulları qorunur): {exc}")
+        items = list(vision_items[:35]) if vision_items else []
 
     cleaned = []
     searched_images = 0
@@ -587,7 +594,7 @@ def main():
     tg_blocks, tg_vision = scrape_telegram_channels()
     vision_items = extract_from_promo_images_vision(client, ig_vision + fb_vision + tg_vision)
 
-    raw_blocks = web_blocks + ig_blocks + fb_blocks + tg_blocks
+    raw_blocks = web_blocks + ig_blocks[:25] + fb_blocks[:25] + tg_blocks
     products = analyze_discounts_with_gemini(client, raw_blocks, vision_items, existing_history, image_cache)
     with_img = sum(1 for p in products if p.get("imageUrl"))
     print(f"Tapılan endirimli məhsul: {len(products)} (tək məhsul şəkilli: {with_img})")
