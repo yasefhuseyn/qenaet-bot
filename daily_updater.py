@@ -37,7 +37,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
-from urllib.parse import quote, urljoin, urlparse
+from urllib.parse import quote, unquote, urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -48,8 +48,12 @@ from urllib3.util.retry import Retry
 try:
     import firebase_admin
     from firebase_admin import credentials, firestore
+    try:
+        from firebase_admin import messaging
+    except ImportError:
+        messaging = None
 except ImportError:  # DRY_RUN üçün Firebase lazım deyil
-    firebase_admin = credentials = firestore = None
+    firebase_admin = credentials = firestore = messaging = None
 
 try:
     from google import genai
@@ -267,6 +271,25 @@ def short_hash(text: str, n: int = 10) -> str:
     return hashlib.md5(text.encode("utf-8")).hexdigest()[:n]
 
 
+def with_retry(fn, label: str, tries: int = 3, delay: int = 15, is_empty=None, default=None):
+    """Müvəqqəti xəta və ya boş cavab olanda təkrar cəhd edir; sonda ən yaxşı nəticəni qaytarır."""
+    is_empty = is_empty or (lambda r: not r)
+    res = default
+    for i in range(1, tries + 1):
+        try:
+            res = fn()
+            if not is_empty(res):
+                if i > 1:
+                    log.info("  [Təkrar cəhd] %s: %d-ci cəhddə alındı", label, i)
+                return res
+            log.warning("  [Boş cavab] %s (cəhd %d/%d)", label, i, tries)
+        except Exception as exc:
+            log.warning("  [Xəta] %s (cəhd %d/%d): %s", label, i, tries, str(exc)[:120])
+        if i < tries:
+            time.sleep(delay * i)
+    return res
+
+
 def normalize_market(name: str) -> str:
     low = (name or "").lower()
     for alias in sorted(MARKET_ALIASES, key=len, reverse=True):
@@ -338,7 +361,7 @@ def pick_models(client):
 
 
 _RUN_START = time.time()
-GEMINI_DEADLINE_SEC = env_int("GEMINI_DEADLINE_SEC", 1800)   # bu vaxtdan sonra Gemini çağırılmır (iş yarımçıq qalmasın)
+GEMINI_DEADLINE_SEC = env_int("GEMINI_DEADLINE_SEC", 2000)   # bu vaxtdan sonra Gemini çağırılmır (iş yarımçıq qalmasın)
 
 
 def gemini_text(client, contents) -> str:
@@ -1161,6 +1184,190 @@ def scrape_araz() -> list[dict]:
     return list(uniq.values())
 
 
+CATALOG_BUDGET_SEC = env_int("CATALOG_BUDGET_SEC", 900)
+CATALOG_MAX_ITEMS = env_int("CATALOG_MAX_ITEMS", 6000)
+
+
+def bazar_category_urls() -> list[str]:
+    html = fetch_html("https://bazarstore.az/", timeout=25)
+    soup = BeautifulSoup(html, "html.parser")
+    hrefs = []
+    for a in soup.select("a[href]"):
+        h = urljoin("https://bazarstore.az/", a["href"]).split("#")[0]
+        if h not in hrefs:
+            hrefs.append(h)
+    try:
+        i0 = hrefs.index("https://bazarstore.az/cart")
+    except ValueError:
+        return []
+    end = next((i for i, h in enumerate(hrefs) if "endirimli" in unquote(h).lower()), len(hrefs))
+    return [h for h in hrefs[i0 + 1:end] if h.startswith("https://bazarstore.az/") and h.count("/") == 3]
+
+
+def scrape_bazarstore_catalog(deadline: float) -> list[dict]:
+    """Bazarstore-un bütün kateqoriyalarını gəzib adi + endirimli cari qiymətləri yığır (müqayisə üçün)."""
+    cats = bazar_category_urls()
+    log.info("  [Bazar kataloq] %d kateqoriya tapıldı", len(cats))
+    seen: dict[str, dict] = {}
+
+    def crawl(url):
+        for n in range(1, 9):
+            if time.time() > deadline or len(seen) >= CATALOG_MAX_ITEMS:
+                return
+            items = parse_bazarstore_page(fetch_html(f"{url}?pagesize=60&pagenumber={n}", timeout=25))
+            if not items:
+                return
+            new = 0
+            for it in items:
+                k = normalize_key(it["name"])
+                if k and k not in seen:
+                    seen[k] = {"n": clean_text(it["name"], 70), "p": it["price"], "o": it.get("oldPrice") or 0}
+                    new += 1
+            if new == 0 or len(items) < 10:
+                return
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(crawl, cats))
+    log.info("  [Bazar kataloq] %d məhsul yığıldı", len(seen))
+    return list(seen.values())
+
+
+def _araz_products(obj, out: dict):
+    if isinstance(obj, dict):
+        if obj.get("title") and (obj.get("sales_price") or obj.get("discount_price")) and obj.get("id") is not None:
+            out[obj["id"]] = obj
+            return
+        for v in obj.values():
+            _araz_products(v, out)
+    elif isinstance(obj, list):
+        for v in obj:
+            _araz_products(v, out)
+
+
+def scrape_araz_catalog(deadline: float) -> list[dict]:
+    """Araz API-sindən kateqoriya üzrə bütün məhsulları çəkməyə çalışır (API ünvanları sınaqla müəyyən edilir)."""
+    host = "b7x9kq.arazmarket.az"
+    m = re.search(r"https://([\w-]+\.arazmarket\.az)/storage", fetch_html("https://www.arazmarket.az/", timeout=25) or "")
+    if m:
+        host = m.group(1)
+    base = f"https://{host}/api"
+    found: dict = {}
+    cats = []
+    for path in ("/categories", "/products?page=1", "/products", "/category-tree", "/menu"):
+        try:
+            r = SESSION.get(base + path, timeout=20)
+            log.info("  [Araz kataloq] %s → HTTP %s (%d bayt)", path, r.status_code, len(r.content))
+            if r.status_code != 200:
+                continue
+            data = r.json()
+        except Exception:
+            continue
+        _araz_products(data, found)
+
+        def walk_cats(o):
+            if isinstance(o, dict):
+                if o.get("id") is not None and (o.get("slug") or o.get("title")) and not (o.get("sales_price") or o.get("discount_price")):
+                    cats.append((o["id"], o.get("slug") or ""))
+                for v in o.values():
+                    walk_cats(v)
+            elif isinstance(o, list):
+                for v in o:
+                    walk_cats(v)
+        walk_cats(data.get("data", data) if isinstance(data, dict) else data)
+    cats = list(dict.fromkeys(cats))[:500]
+    log.info("  [Araz kataloq] %d kateqoriya, ilkin %d məhsul", len(cats), len(found))
+    templates = ["/products?category_id={id}&page={n}", "/products?category={slug}&page={n}", "/category/{slug}?page={n}",
+                 "/categories/{id}/products?page={n}"]
+    tpl = None
+    for cid, slug in cats[:6]:
+        for t in templates:
+            try:
+                r = SESSION.get(base + t.format(id=cid, slug=slug, n=1), timeout=20)
+                before = len(found)
+                if r.status_code == 200:
+                    _araz_products(r.json(), found)
+                if len(found) > before:
+                    tpl = t
+                    break
+            except Exception:
+                continue
+        if tpl:
+            break
+    if tpl:
+        log.info("  [Araz kataloq] işləyən ünvan: %s", tpl)
+
+        def crawl(cat):
+            cid, slug = cat
+            for n in range(1, 11):
+                if time.time() > deadline or len(found) >= CATALOG_MAX_ITEMS:
+                    return
+                try:
+                    r = SESSION.get(base + tpl.format(id=cid, slug=slug, n=n), timeout=20)
+                    before = len(found)
+                    if r.status_code == 200:
+                        _araz_products(r.json(), found)
+                    if len(found) == before:
+                        return
+                except Exception:
+                    return
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            list(pool.map(crawl, cats))
+    else:
+        log.warning("  [Araz kataloq] kateqoriya API-si tapılmadı — yalnız ana səhifə məhsulları")
+    out = []
+    for p_ in found.values():
+        price, old = safe_float(p_.get("discount_price")) or safe_float(p_.get("sales_price")), safe_float(p_.get("sales_price"))
+        if price:
+            out.append({"n": clean_text(p_["title"], 70), "p": price, "o": old if old and old > price else 0})
+    log.info("  [Araz kataloq] %d məhsul yığıldı", len(out))
+    return out
+
+
+def scrape_full_catalogs() -> dict:
+    deadline = time.time() + CATALOG_BUDGET_SEC
+    res = {}
+    for name, fn in (("Bazarstore", scrape_bazarstore_catalog), ("Araz", scrape_araz_catalog)):
+        try:
+            res[name] = fn(deadline)
+        except Exception as exc:
+            log.warning("  [%s kataloq xətası] %s", name, str(exc)[:160])
+            res[name] = []
+    return res
+
+
+class CatalogIndex:
+    """Marketin bütün kataloqunda ad + çəki üzrə eyni məhsulu tapır."""
+
+    def __init__(self, market: str, items: list[dict]):
+        self.market, self.entries, self.inv = market, [], {}
+        for it in items:
+            toks = core_tokens(it["n"])
+            if not toks:
+                continue
+            idx = len(self.entries)
+            self.entries.append({"name": it["n"], "price": it["p"], "old": it.get("o") or 0, "tok": toks})
+            for t in toks:
+                if len(t) >= 4:
+                    self.inv.setdefault(t, []).append(idx)
+
+    def find(self, name: str):
+        toks = core_tokens(name)
+        if not toks:
+            return None
+        cands = set()
+        for t in sorted(toks, key=len, reverse=True)[:2]:
+            cands.update(self.inv.get(t, [])[:400])
+        probe = {"name": name, "unit": ""}
+        best = None
+        for i in cands:
+            e = self.entries[i]
+            if same_product(probe, {"name": e["name"], "unit": ""}) or \
+               (len(toks & e["tok"]) >= 2 and size_sig(name) in (None, size_sig(e["name"]))):
+                if best is None or e["price"] < best["price"]:
+                    best = e
+        return best
+
+
 def extract_cards_generic(soup, market: str, base: str, promo_page: bool) -> list[dict]:
     """Ümumi məhsul kartı çıxarıcısı: başlıq + şəkil + ₼ qiymət olan ən kiçik blokları tapır."""
     if len(str(soup)) > 700_000:
@@ -1222,16 +1429,19 @@ def collect_promo_images(soup, base: str, market: str, limit: int) -> list[dict]
 # --------------------------------------------------------------------------- Apify (Instagram, Facebook)
 def apify_run(actor: str, token: str, payload: dict, label: str) -> list:
     endpoint = f"https://api.apify.com/v2/acts/{actor}/run-sync-get-dataset-items"
-    try:
+
+    def once():
         r = requests.post(endpoint, json=payload, headers={"Authorization": f"Bearer {token}"}, timeout=240)
-        if r.status_code not in (200, 201):
-            log.error("  [Apify %s xəta] HTTP %s: %s", label, r.status_code, r.text[:200])
-            return []
-        data = r.json()
-        return data if isinstance(data, list) else []
-    except Exception as exc:
-        log.error("  [Apify %s xəta] %s", label, type(exc).__name__)
-        return []
+        if r.status_code in (200, 201):
+            data = r.json()
+            return data if isinstance(data, list) else []
+        log.error("  [Apify %s xəta] HTTP %s: %s", label, r.status_code, r.text[:200])
+        if r.status_code in (400, 401, 402, 403):   # təkrar cəhdin mənası yoxdur (kredit/icazə problemi)
+            return None
+        raise RuntimeError(f"HTTP {r.status_code}")
+
+    res = with_retry(once, f"Apify {label}", tries=2, delay=20, is_empty=lambda r: r is None or r == [], default=[])
+    return res or []
 
 
 def scrape_instagram_via_apify(token: str, socials: dict) -> tuple[list[dict], list[dict]]:
@@ -1321,7 +1531,8 @@ def scrape_one_telegram(market: str, slug: str) -> tuple[list[dict], list[dict]]
 def scrape_telegram_channels(channels: dict) -> tuple[list[dict], list[dict]]:
     blocks, vision = [], []
     with ThreadPoolExecutor(max_workers=5) as pool:
-        for b, v in pool.map(lambda kv: scrape_one_telegram(*kv), channels.items()):
+        for b, v in pool.map(lambda kv: with_retry(lambda: scrape_one_telegram(*kv), f"Telegram {kv[0]}", tries=2, delay=5,
+                                                   is_empty=lambda r: not r[0] and not r[1], default=([], [])), channels.items()):
             blocks += b
             vision += v
     return blocks, vision
@@ -1737,7 +1948,7 @@ def bazar_regular_lookup(name: str):
     return None
 
 
-def build_products(raw_items: list[dict], prev_items: list[dict], image_cache: dict, today: str, client=None) -> tuple[list[dict], list[dict]]:
+def build_products(raw_items: list[dict], prev_items: list[dict], image_cache: dict, today: str, client=None, catalogs: dict | None = None) -> tuple[list[dict], list[dict]]:
     """Təmizləyir, təkrarları birləşdirir, marketlər arası müqayisə qurur, tarixçə və şəkilləri yeniləyir."""
     # 1. Təmizlə və (məhsul, market) üzrə ən ucuz təklifi saxla
     entries: dict[str, dict] = {}
@@ -1776,20 +1987,30 @@ def build_products(raw_items: list[dict], prev_items: list[dict], image_cache: d
 
     # 4. Marketlər arası qruplaşdırma
     groups = group_entries(list(entries.values()))
-    # Bazarstore-da olmayan məhsullar üçün onun cari qiymətini axtar (müqayisə üçün)
-    extra_comps: dict[str, dict] = {}
-    todo = []
+    # Başqa marketlərin TAM kataloqundan (adi + endirimli cari qiymət) eyni məhsulu tap
+    extra_comps: dict[str, list] = {}
+    seen_groups = set()
+    todo_old = []
     for hk0, g in groups.items():
-        if all(x["market"] != "Bazarstore" for x in g) and id(g) not in {id(t[1]) for t in todo}:
-            todo.append((hk0, g))
-    if todo:
+        if id(g) in seen_groups:
+            continue
+        seen_groups.add(id(g))
+        for mk in ("Bazarstore", "Araz"):
+            if any(x["market"] == mk for x in g):
+                continue
+            idx = (catalogs or {}).get(mk)
+            if idx is not None and idx.entries:
+                f_ = idx.find(g[0]["name"])
+                if f_:
+                    extra_comps.setdefault(hk0, []).append({"market": mk, "price": f_["price"], "isPromo": bool(f_["old"])})
+            elif mk == "Bazarstore":
+                todo_old.append((hk0, g))
+    if todo_old:   # kataloq alınmayıbsa köhnə üsul: Bazarstore axtarışı
         with ThreadPoolExecutor(max_workers=8) as pool:
-            for (hk0, g), found in zip(todo[:BAZAR_LOOKUP_MAX], pool.map(lambda t: bazar_regular_lookup(t[1][0]["name"]), todo[:BAZAR_LOOKUP_MAX])):
+            for (hk0, g), found in zip(todo_old[:BAZAR_LOOKUP_MAX], pool.map(lambda t: bazar_regular_lookup(t[1][0]["name"]), todo_old[:BAZAR_LOOKUP_MAX])):
                 if found:
-                    extra_comps[hk0] = {"market": "Bazarstore", "price": found["price"], "isPromo": bool(found.get("oldPrice"))}
-                elif len(extra_comps) < 3:
-                    log.info("  [Bazar axtarış] tapılmadı: %s", g[0]["name"])
-        log.info("  Bazarstore qiymət müqayisəsi: %d məhsul üçün tapıldı", len(extra_comps))
+                    extra_comps.setdefault(hk0, []).append({"market": "Bazarstore", "price": found["price"], "isPromo": bool(found.get("oldPrice"))})
+    log.info("  Tam kataloqdan müqayisə: %d məhsul qrupu üçün əlavə qiymət tapıldı", len(extra_comps))
 
     # 5. Şəkillər: öz şəkli → əvvəlki şəkil → keş → internet axtarışı
     entry_list = list(entries.values())
@@ -1854,13 +2075,15 @@ def build_products(raw_items: list[dict], prev_items: list[dict], image_cache: d
         hist = hist[-30:]
 
         if prev and not e.get("carried") and safe_float(prev.get("price")) and e["price"] < safe_float(prev["price"]) - 0.005:
-            drops.append({"name": e["name"], "market": e["market"], "oldPrice": safe_float(prev["price"]), "price": e["price"]})
+            drops.append({"id": "p_" + short_hash(hk), "name": e["name"], "market": e["market"], "oldPrice": safe_float(prev["price"]), "price": e["price"]})
 
         comps = [{"market": g["market"], "price": g["price"], "isPromo": True} for g in groups[hk]]
-        if hk in extra_comps or any(hk2 in extra_comps for hk2 in [f"{x['key']}|{x['market']}" for x in groups[hk]]):
-            ex = extra_comps.get(hk) or next(extra_comps[k2] for k2 in [f"{x['key']}|{x['market']}" for x in groups[hk]] if k2 in extra_comps)
-            if all(c["market"] != "Bazarstore" for c in comps):
-                comps.append(ex)
+        have = {c["market"] for c in comps}
+        for k2 in [hk] + [f"{x['key']}|{x['market']}" for x in groups[hk]]:
+            for ex in extra_comps.get(k2, []):
+                if ex["market"] not in have:
+                    comps.append(ex)
+                    have.add(ex["market"])
         comps.sort(key=lambda c: c["price"])
         match = f"{len(comps)} marketdə müqayisə edildi" if len(comps) > 1 else "Bu marketin təklifidir"
         products.append({
@@ -2033,6 +2256,65 @@ def write_doc(db, name: str, data: dict, dry: bool):
         db.collection("catalog").document(name).set(data)
 
 
+def send_telegram_report(text: str) -> None:
+    """Gecə hesabatını Telegram bot ilə göndərir (TELEGRAM_BOT_TOKEN və TELEGRAM_CHAT_ID varsa)."""
+    token, chat = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip(), os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+    if not token or not chat:
+        log.info("  [Hesabat] TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID yoxdur — hesabat göndərilmədi")
+        return
+    try:
+        r = requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
+                          json={"chat_id": chat, "text": text[:3900], "disable_web_page_preview": True}, timeout=20)
+        log.info("  [Hesabat] Telegram: HTTP %s", r.status_code)
+    except Exception as exc:
+        log.warning("  [Hesabat xətası] %s", type(exc).__name__)
+
+
+def send_price_drop_notifications(db, drops: list[dict], dry: bool) -> int:
+    """Sevimli məhsulunun qiyməti düşən istifadəçilərə telefon bildirişi göndərir (FCM)."""
+    if not drops:
+        return 0
+    if dry or db is None or messaging is None:
+        log.info("  [Bildiriş] %d qiymət düşməsi var (sınaq rejimi/messaging yoxdur — göndərilmədi)", len(drops))
+        return 0
+    by_id = {d["id"]: d for d in drops if d.get("id")}
+    sent = 0
+    try:
+        users = list(db.collection("users").stream())
+    except Exception as exc:
+        log.warning("  [Bildiriş] istifadəçilər oxunmadı: %s", str(exc)[:120])
+        return 0
+    for u in users:
+        d = u.to_dict() or {}
+        tokens = [t for t in (d.get("fcmTokens") or []) if isinstance(t, str) and t]
+        prefs = d.get("notifPrefs") or {}
+        if not tokens or prefs.get("priceDrop") is False:
+            continue
+        mine = [by_id[f] for f in (d.get("favorites") or []) if f in by_id]
+        if not mine:
+            continue
+        mine.sort(key=lambda x: (x["oldPrice"] - x["price"]) / x["oldPrice"] if x.get("oldPrice") else 0, reverse=True)
+        lines = [f"{x['name']} ({x['market']}): {x['oldPrice']:.2f} → {x['price']:.2f} ₼" for x in mine[:3]]
+        if len(mine) > 3:
+            lines.append(f"və daha {len(mine) - 3} məhsul")
+        try:
+            msg = messaging.MulticastMessage(
+                tokens=tokens[:20],
+                notification=messaging.Notification(title="Sevimli məhsulunun qiyməti düşdü 📉", body="\n".join(lines)),
+                webpush=messaging.WebpushConfig(fcm_options=messaging.WebpushFCMOptions(link="https://qenaet.pages.dev/")),
+            )
+            resp = messaging.send_each_for_multicast(msg)
+            sent += resp.success_count
+            dead = [tokens[i] for i, r in enumerate(resp.responses) if not r.success and getattr(r.exception, "code", "") in ("NOT_FOUND", "UNREGISTERED", "INVALID_ARGUMENT")]
+            if dead:
+                u.reference.update({"fcmTokens": firestore.ArrayRemove(dead)})
+        except Exception as exc:
+            log.warning("  [Bildiriş xətası] %s", str(exc)[:120])
+    log.info("  [Bildiriş] %d bildiriş göndərildi", sent)
+    STATS["push_sent"] = sent
+    return sent
+
+
 def cashback_changes(old_cards: list, new_cards: list) -> list[dict]:
     old = {c.get("id"): c for c in old_cards if isinstance(c, dict)}
     changes = []
@@ -2083,7 +2365,10 @@ def main():
     log.info("2. Market saytları skan edilir (endirim səhifələri avtomatik tapılır)...")
     web_blocks, structured, socials, tg_channels, web_vision = scrape_market_websites()
     log.info("2b. Bazarstore və Araz endirim məlumatları (API/səhifələr)...")
-    structured += scrape_bazarstore() + scrape_araz()
+    structured += with_retry(scrape_bazarstore, "Bazarstore", default=[]) + with_retry(scrape_araz, "Araz", default=[])
+    log.info("2c. Bazarstore və Araz TAM kataloqu arxa planda yığılır (müqayisə üçün)...")
+    catalog_pool = ThreadPoolExecutor(max_workers=1)
+    catalog_future = catalog_pool.submit(scrape_full_catalogs)
 
     ig_blocks, ig_vision, fb_blocks, fb_vision = [], [], [], []
     if apify_token:
@@ -2122,7 +2407,24 @@ def main():
     raw_items = structured + vision_items + gemini_items
     log.info("  Xam məhsul: sayt/API %d + Vision %d + Gemini %d", len(structured), len(vision_items), len(gemini_items))
 
-    products, drops = build_products(raw_items, prev_items, image_cache, today, client)
+    catalogs = {}
+    try:
+        full = catalog_future.result(timeout=max(60, CATALOG_BUDGET_SEC + 120 - int(time.time() - started)))
+    except Exception as exc:
+        log.warning("  [Tam kataloq] gözləmə xətası: %s", str(exc)[:120])
+        full = {}
+    for mk, items_ in full.items():
+        doc_name = "market_prices_" + mk.lower()
+        if items_:
+            write_doc(db, doc_name, {"updatedLabel": f"Yeniləndi: {now_label}", "date": today, "count": len(items_), "items": items_[:CATALOG_MAX_ITEMS]}, dry)
+        else:   # alınmadısa dünənki kataloqdan istifadə et
+            items_ = [x for x in read_doc(db, doc_name).get("items", []) if isinstance(x, dict) and x.get("n")]
+            if items_:
+                log.info("  [Tam kataloq] %s: bu gün alınmadı, əvvəlki kataloq istifadə olunur (%d)", mk, len(items_))
+        if items_:
+            catalogs[mk] = CatalogIndex(mk, items_)
+            STATS["catalog_" + mk.lower()] = len(items_)
+    products, drops = build_products(raw_items, prev_items, image_cache, today, client, catalogs)
     with_img = sum(1 for p in products if p.get("imageUrl"))
     multi = sum(1 for p in products if len(p["comparisons"]) > 1)
     log.info("Yekun məhsul: %d (şəkilli: %d, çox marketdə müqayisəli: %d, qiyməti düşən: %d)", len(products), with_img, multi, len(drops))
@@ -2169,11 +2471,36 @@ def main():
         "priceDrops": drops[:60], "cashbackChanges": cb_changes[:40],
     }, dry)
 
+    log.info("7. Qiyməti düşən sevimli məhsullar üçün bildirişlər...")
+    send_price_drop_notifications(db, drops, dry)
+
     log.info("— Yekun —  vaxt: %ds | %s", int(time.time() - started), json.dumps(STATS, ensure_ascii=False))
+    report = (
+        f"Qənaət botu — {now_label}\n"
+        f"Məhsul: {len(products)} (şəkilli {with_img}, çox marketdə müqayisəli {multi}, qiyməti düşən {len(drops)})\n"
+        f"Bazarstore kataloq: {STATS.get('catalog_bazarstore', 0)} | Araz kataloq: {STATS.get('catalog_araz', 0)}\n"
+        f"Paylaşım: Instagram {STATS.get('ig_posts', 0)}, Facebook {STATS.get('fb_posts', 0)}, Telegram {STATS.get('tg_posts', 0)}\n"
+        f"Şəkildən oxunan (təsdiqli): {STATS.get('single_photo', 0)}, təsdiqlənməyib atılan: {STATS.get('vision_dropped', 0)}\n"
+        f"Kataloqdan kəsilən: təsdiq {len([1 for p_ in products if str(p_.get('imageUrl','')).startswith(CROP_RAW_BASE)])}, rədd {STATS.get('crop_rejected', 0)}\n"
+        f"Bank kartı: {len(cards)} | Bildiriş: {STATS.get('push_sent', 0)}\n"
+        f"Müddət: {int((time.time() - started) / 60)} dəq"
+    )
+    if time.time() - _RUN_START > GEMINI_DEADLINE_SEC:
+        report += "\nDiqqət: Gemini vaxt limiti keçdi, bəzi mərhələlər yarımçıq qala bilər."
+    if not products:
+        report += "\nDiqqət: yeni endirim tapılmadı, əvvəlki kataloq qorundu."
+    send_telegram_report(report)
     if total_sources == 0:
         log.error("Heç bir mənbədən məlumat alınmadı (şəbəkə və ya saytlar dəyişib).")
+        send_telegram_report("Qənaət botu: HEÇ BİR mənbədən məlumat alınmadı (şəbəkə və ya saytlar dəyişib).")
         sys.exit(1)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SystemExit:
+        raise
+    except Exception as exc:
+        send_telegram_report(f"Qənaət botu XƏTA ilə dayandı: {type(exc).__name__}: {str(exc)[:300]}")
+        raise
