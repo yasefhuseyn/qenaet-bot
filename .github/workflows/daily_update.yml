@@ -4,15 +4,30 @@ on:
   schedule:
     - cron: '0 4 * * *'
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Sınaq rejimi (Firestore-a yazmır, nəticəni Artifacts-də verir)'
+        type: boolean
+        default: false
+      use_apify:
+        description: 'Apify (Instagram/Facebook) istifadə olunsun (kredit xərcləyir)'
+        type: boolean
+        default: true
+
+concurrency:
+  group: qenaet-daily
+  cancel-in-progress: false
 
 jobs:
   update:
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.12'
+          cache: pip
       - name: Paketləri quraşdır
         run: pip install -r requirements.txt
       - name: Gündəlik yeniləməni işə sal
@@ -20,4 +35,12 @@ jobs:
           FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
+          DRY_RUN: ${{ inputs.dry_run && '1' || '0' }}
+          USE_APIFY: ${{ inputs.use_apify == false && '0' || '1' }}
         run: python daily_updater.py
+      - name: Nəticəni saxla (sınaq rejimi)
+        if: ${{ inputs.dry_run }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: dry-run-output
+          path: out/

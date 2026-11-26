@@ -1,5 +1,5 @@
 """
-Qənaət — Super Bot v5.0
+Qənaət — Super Bot v6.0
 Hər səhər GitHub Actions üzərindən işləyir (Apify $5 pulsuz kredit + Gemini Free Tier):
 
  1. 10 marketin rəsmi saytını və saytdan avtomatik tapılan "endirim/aksiya/kampaniya" səhifələrini skan edir.
@@ -22,6 +22,8 @@ Lazım olan gizli açarlar: FIREBASE_SERVICE_ACCOUNT, GEMINI_API_KEY, (istəyə 
   EXTRA_PAGES_PER_MARKET=3 Hər saytda əlavə baxılacaq endirim səhifəsi
   IMAGE_SEARCH_MAX=40      İnternetdə məhsul şəkli axtarışı limiti
   TELEGRAM_EXTRA="Bravo:kanal1,OBA:kanal2"   əlavə Telegram kanalları
+  BAZAR_MAX_PRODUCTS=240   Bazarstore endirim səhifələrindən maksimum məhsul
+  USE_APIFY=0              Apify addımını söndürür (xərc yoxdur)
 """
 from __future__ import annotations
 
@@ -61,6 +63,8 @@ except ImportError:
     DDGS = None
 
 log = logging.getLogger("qenaet")
+for _n in ("google_genai", "google_genai.models", "google.genai", "httpx", "httpcore", "urllib3"):
+    logging.getLogger(_n).setLevel(logging.WARNING)
 
 BAKU_TZ = timezone(timedelta(hours=4))
 HEADERS = {
@@ -79,10 +83,13 @@ def env_int(name: str, default: int) -> int:
 IG_POSTS = env_int("IG_POSTS_PER_PAGE", 3)
 FB_POSTS = env_int("FB_POSTS_PER_PAGE", 3)
 TG_POSTS = env_int("TG_POSTS_PER_CHANNEL", 12)
-VISION_MAX = env_int("VISION_MAX_IMAGES", 15)
+VISION_MAX = env_int("VISION_MAX_IMAGES", 40)
+VISION_PER_CALL = 4        # bir Gemini sorğusunda neçə şəkil oxunsun
+VISION_PER_MARKET = 10     # hər saytdan maksimum promo şəkli
+BAZAR_MAX = env_int("BAZAR_MAX_PRODUCTS", 240)
 EXTRA_PAGES = env_int("EXTRA_PAGES_PER_MARKET", 3)
-IMAGE_SEARCH_MAX = env_int("IMAGE_SEARCH_MAX", 40)
-MAX_PRODUCTS = 120
+IMAGE_SEARCH_MAX = env_int("IMAGE_SEARCH_MAX", 60)
+MAX_PRODUCTS = 300
 MAX_AGE_DAYS = 10          # bundan köhnə sosial şəbəkə paylaşımları atılır
 MIN_PRICE, MAX_PRICE = 0.05, 300.0
 GEMINI_BATCH_CHARS = 22000
@@ -90,7 +97,7 @@ GEMINI_MAX_BATCHES = 4
 GEMINI_MIN_INTERVAL = 4.0  # saniyə (pulsuz limitə uyğun)
 LOGO_VERSION = 2           # dəyişəndə bütün loqolar yenidən yoxlanılır
 IMAGE_CACHE_VERSION = 2    # dəyişəndə köhnə (yanlış ola bilən) şəkil keşi silinir
-VERIFY_MAX = env_int("VISION_VERIFY_MAX", 30)   # axtarışla tapılan şəkilləri AI ilə yoxlama limiti
+VERIFY_MAX = env_int("VISION_VERIFY_MAX", 60)   # axtarışla tapılan şəkilləri AI ilə yoxlama limiti
 NEG_CACHE_DAYS = 14        # uyğun şəkil tapılmayan məhsul bu müddət təkrar axtarılmır
 _verify_used = 0
 
@@ -174,9 +181,13 @@ PROMO_KEYWORDS = ("endirim", "aksiya", "kampaniya", "special", "promo", "offer",
                   "catalog", "teklif", "təklif", "sale", "kampaniy")
 PRICE_RE = re.compile(r"\d+(?:[.,]\d{1,2})?\s*(?:₼|azn|man\b|manat)", re.I)
 
-GEMINI_MODELS = ["gemini-2.5-flash", "gemini-3-flash-preview", "gemini-2.5-flash-lite"]
+# Köhnə model adları 404 verir; "-latest" ləqəbləri həmişə cari modelə işarə edir
+GEMINI_MODELS = ["gemini-flash-latest", "gemini-3.5-flash", "gemini-3.5-flash-lite",
+                 "gemini-flash-lite-latest", "gemini-3-flash-preview"]
+_dead_models: set = set()      # bu işləmədə 404/kvota bitmiş modellər təkrar yoxlanılmır
+_cool_until: dict = {}         # həddən artıq yüklənmiş modellər müvəqqəti gözləyir
 
-STATS = {"image_verified": 0, "web_pages": 0, "structured": 0, "ig_posts": 0, "fb_posts": 0, "tg_posts": 0,
+STATS = {"bazar": 0, "araz": 0, "cards": 0, "image_verified": 0, "web_pages": 0, "structured": 0, "ig_posts": 0, "fb_posts": 0, "tg_posts": 0,
          "vision_images": 0, "gemini_calls": 0, "gemini_errors": 0, "image_searches": 0}
 
 
@@ -283,43 +294,85 @@ def extract_json_array(raw_text: str) -> list:
 _last_gemini_call = 0.0
 
 
+def pick_models(client):
+    """Hesabda həqiqətən mövcud olan modelləri seçir (köhnə ad 404 verməsin)."""
+    global GEMINI_MODELS
+    try:
+        avail = set()
+        for m in client.models.list():
+            acts = getattr(m, "supported_actions", None) or getattr(m, "supported_generation_methods", None) or []
+            if "generateContent" in acts:
+                avail.add(m.name.replace("models/", ""))
+        chosen = [m for m in GEMINI_MODELS if m in avail]
+        extra = sorted((m for m in avail if re.fullmatch(r"gemini-[\d.]+-flash(-lite)?", m) and m not in chosen), reverse=True)
+        GEMINI_MODELS = (chosen + extra)[:6] or GEMINI_MODELS
+        log.info("  [Gemini] istifadə olunacaq modellər: %s", ", ".join(GEMINI_MODELS))
+    except Exception as exc:
+        log.warning("  [Gemini] model siyahısı alınmadı (%s), standart siyahı işlədilir", type(exc).__name__)
+
+
 def gemini_text(client, contents) -> str:
-    """Gemini-yə sorğu göndərir; model ardıcıllığı, gözləmə və təkrar cəhd daxildir. Mətn qaytarır."""
+    """Gemini-yə sorğu: işləməyən modeli atır, yüklənmiş modeli gözlədir, növbəti modelə keçir."""
     global _last_gemini_call
     config = None
     if types is not None:
         try:
-            config = types.GenerateContentConfig(response_mime_type="application/json", temperature=0.1)
+            config = types.GenerateContentConfig(
+                response_mime_type="application/json", temperature=0.1,
+                automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True))
         except Exception:
-            config = None
-    last_err = None
-    for model_name in GEMINI_MODELS:
-        for attempt in range(3):
-            wait = GEMINI_MIN_INTERVAL - (time.time() - _last_gemini_call)
-            if wait > 0:
-                time.sleep(wait)
             try:
-                _last_gemini_call = time.time()
-                STATS["gemini_calls"] += 1
-                kwargs = {"model": model_name, "contents": contents}
-                if config is not None:
-                    kwargs["config"] = config
-                resp = client.models.generate_content(**kwargs)
-                return getattr(resp, "text", None) or ""
-            except Exception as exc:
-                last_err = exc
-                msg = str(exc)
-                if "404" in msg or "NOT_FOUND" in msg:
-                    break  # növbəti modelə keç
-                if any(k in msg for k in ("503", "429", "UNAVAILABLE", "RESOURCE_EXHAUSTED", "overloaded")):
-                    w = 8 * (attempt + 1)
-                    log.warning("  [Gemini %s] müvəqqəti yüklənmə (%d/3), %ds gözlənilir...", model_name, attempt + 1, w)
-                    time.sleep(w)
-                    continue
-                STATS["gemini_errors"] += 1
-                raise
+                config = types.GenerateContentConfig(response_mime_type="application/json", temperature=0.1)
+            except Exception:
+                config = None
+    last_err = None
+    for _round in range(3):
+        usable = [m for m in GEMINI_MODELS if m not in _dead_models]
+        if not usable:
+            break
+        for model_name in usable:
+            if _cool_until.get(model_name, 0) > time.time():
+                continue
+            for attempt in range(2):
+                wait = GEMINI_MIN_INTERVAL - (time.time() - _last_gemini_call)
+                if wait > 0:
+                    time.sleep(wait)
+                try:
+                    _last_gemini_call = time.time()
+                    STATS["gemini_calls"] += 1
+                    kwargs = {"model": model_name, "contents": contents}
+                    if config is not None:
+                        kwargs["config"] = config
+                    resp = client.models.generate_content(**kwargs)
+                    return getattr(resp, "text", None) or ""
+                except Exception as exc:
+                    last_err = exc
+                    msg = str(exc)
+                    if any(k in msg for k in ("404", "NOT_FOUND", "403", "PERMISSION_DENIED")):
+                        _dead_models.add(model_name)
+                        log.warning("  [Gemini] %s mövcud deyil/icazə yoxdur — bu işləmədə atılır", model_name)
+                        break
+                    if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
+                        if attempt == 1 or re.search(r"per.?day|PerDay", msg, re.I):
+                            _dead_models.add(model_name)
+                            log.warning("  [Gemini] %s kvotası bitdi — növbəti modelə keçilir", model_name)
+                            break
+                        time.sleep(12)
+                        continue
+                    if any(k in msg for k in ("503", "UNAVAILABLE", "overloaded", "500", "INTERNAL", "DEADLINE")):
+                        time.sleep(4 * (attempt + 1))
+                        if attempt == 1:
+                            _cool_until[model_name] = time.time() + 90
+                            log.warning("  [Gemini] %s yüklənib — 90s kənara qoyuldu", model_name)
+                        continue
+                    STATS["gemini_errors"] += 1
+                    raise
+        cooling = [t for m, t in _cool_until.items() if m not in _dead_models and t > time.time()]
+        if not cooling:
+            break
+        time.sleep(min(max(cooling) - time.time(), 60) + 1)
     STATS["gemini_errors"] += 1
-    raise last_err or RuntimeError("Gemini cavab vermədi")
+    raise last_err or RuntimeError("Gemini cavab vermədi (bütün modellər əlçatmazdır)")
 
 
 # --------------------------------------------------------------------------- şəkillər
@@ -395,8 +448,16 @@ def vision_confirms_product(client, image_url: str, product_name: str) -> bool:
         return False
 
 
+MARKET_IMAGE_DOMAINS = ("almarket.az", "bazarstore.az", "arazmarket.az", "oba.az", "obafiles", "bravosupermarket.az",
+                        "rahatmarket.az", "neptun.az", "bolmart.az", "grandmart", "azersun", "sima.az", "kontakt.az")
+
+
+def clean_query_name(name: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"\b(kq|st|bah|lim)\b", " ", name, flags=re.I)).strip()
+
+
 def find_high_quality_product_image(product_name: str, image_cache: dict, client=None, today: str = "") -> str:
-    """İnternetdə axtarır, AMMA yalnız Gemini təsdiq etdiyi şəkli qəbul edir. Əmin deyilsə boş qaytarır."""
+    """İnternetdə (Google/Bing) məhsulun adı ilə axtarır, AMMA yalnız Gemini təsdiq etdiyi şəkli qəbul edir."""
     key = normalize_key(product_name)
     cached = image_cache.get(key) or ""
     if cached.startswith("https://"):
@@ -411,25 +472,39 @@ def find_high_quality_product_image(product_name: str, image_cache: dict, client
         return ""
     STATS["image_searches"] += 1
     need = 2 if len(name_tokens(product_name)) >= 2 else 1
-    candidates = []
-    for q in (f"{product_name} Azərbaycan market", f'"{product_name}"'):
-        try:
-            time.sleep(0.6)
-            for item in DDGS().images(q, max_results=8) or []:
+    qname = clean_query_name(product_name)
+    scored = {}
+    for q in (qname, f"{qname} market"):
+        for backend in ("google", "bing"):
+            try:
+                time.sleep(0.5)
+                results = DDGS().images(q, max_results=10, backend=backend) or []
+            except Exception as exc:
+                log.debug("  [Şəkil axtarış] %s/%s: %s", backend, q, type(exc).__name__)
+                continue
+            for item in results:
                 img_url = item.get("image") or ""
                 w, h = int(item.get("width") or 0), int(item.get("height") or 0)
-                if (w and h and (w < 250 or h < 250)) or img_url in candidates:
+                if not img_url.startswith("https://") or img_url in scored or (w and h and (w < 300 or h < 300)):
                     continue
-                if not tokens_overlap(product_name, (item.get("title") or "") + " " + img_url, need):
+                overlap = len(name_tokens(product_name) & name_tokens((item.get("title") or "") + " " + img_url))
+                if overlap < min(need, len(name_tokens(product_name)) or need):
                     continue
-                if verify_image_url(img_url, min_dim=220):
-                    candidates.append(img_url)
-        except Exception as exc:
-            log.warning("  [Şəkil axtarış xətası] %s: %s", product_name, exc)
+                host = urlparse(img_url).netloc.lower()
+                boost = 3 if any(d in host or d in img_url for d in MARKET_IMAGE_DOMAINS) else (1 if host.endswith(".az") else 0)
+                scored[img_url] = boost * 10 + overlap
+            if len(scored) >= 3:
+                break
+        if len(scored) >= 3:
             break
-        if len(candidates) >= 2:
+    ranked = sorted(scored, key=lambda u: -scored[u])
+    checked = 0
+    for img_url in ranked:
+        if checked >= 3:
             break
-    for img_url in candidates[:2]:
+        if not verify_image_url(img_url, min_dim=300):
+            continue
+        checked += 1
         if vision_confirms_product(client, img_url, product_name):
             image_cache[key] = img_url
             return img_url
@@ -438,7 +513,7 @@ def find_high_quality_product_image(product_name: str, image_cache: dict, client
     return ""
 
 
-def logo_ok(url: str) -> bool:
+def logo_ok(url: str, min_side: int = 48) -> bool:
     """Loqo kvadrata yaxın, kifayət qədər böyük və açıla bilən şəkil olmalıdır (banner/og:image deyil)."""
     if not url or not url.startswith("https://") or url.lower().split("?")[0].endswith(".svg"):
         return False
@@ -448,7 +523,7 @@ def logo_ok(url: str) -> bool:
             return False
         im = Image.open(io.BytesIO(r.content))
         w, h = im.size
-        return w >= 48 and h >= 48 and 0.7 <= w / float(h) <= 1.4
+        return w >= min_side and h >= min_side and 0.7 <= w / float(h) <= 1.4
     except Exception:
         return False
 
@@ -500,8 +575,12 @@ def collect_brand_logos(existing_logos: dict) -> dict:
 
     def find(item):
         name, domain = item
-        for cand in logo_candidates(domain)[:8]:
+        cands = logo_candidates(domain)
+        for cand in cands[:8]:
             if logo_ok(cand):
+                return name, cand
+        for cand in cands:  # son çarə: favicon xidmətləri (kiçik ölçü qəbul edilir)
+            if ("favicons" in cand or "duckduckgo" in cand) and logo_ok(cand, min_side=32):
                 return name, cand
         return name, ""
 
@@ -608,7 +687,8 @@ def discover_socials(soup, socials: dict, tg: dict):
                 tg.setdefault("slug", slug)
 
 
-def page_to_block(soup, market: str, page_url: str) -> dict | None:
+def page_to_block(soup, market: str, page_url: str, base: str = "") -> dict | None:
+    base = base or page_url
     for tag in soup(["script", "style", "noscript", "svg", "footer", "nav"]):
         tag.decompose()
     images = []
@@ -616,7 +696,7 @@ def page_to_block(soup, market: str, page_url: str) -> dict | None:
         src = img.get("src") or img.get("data-src") or img.get("data-lazy-src") or ""
         if not src or src.startswith("data:"):
             continue
-        full = urljoin(page_url, src)
+        full = urljoin(base, src)
         low = full.lower()
         if any(skip in low for skip in ("logo", "icon", "favicon", "flag", "sprite", "avatar", "banner")):
             continue
@@ -629,41 +709,48 @@ def page_to_block(soup, market: str, page_url: str) -> dict | None:
 
 
 def scrape_one_market(market: str, url: str) -> dict:
-    out = {"market": market, "blocks": [], "structured": [], "socials": {}, "telegram": ""}
+    out = {"market": market, "blocks": [], "structured": [], "socials": {}, "telegram": "", "vision": []}
     html = fetch_html(url)
     if not html:
         return out
     soup0 = BeautifulSoup(html, "html.parser")
+    base0 = (soup0.find("base") or {}).get("href") or url
     pages = [(url, soup0)]
-    for extra in discover_promo_links(soup0, url)[:EXTRA_PAGES]:
+    for extra in discover_promo_links(soup0, base0)[:EXTRA_PAGES]:
         h = fetch_html(extra, timeout=14)
         if h:
             pages.append((extra, BeautifulSoup(h, "html.parser")))
 
     tg = {}
     for page_url, soup in pages:
+        base = (soup.find("base") or {}).get("href") or page_url
         promo_page = any(k in page_url.lower() for k in PROMO_KEYWORDS)
         discover_socials(soup, out["socials"], tg)
         out["structured"] += extract_structured_products(soup, market, page_url, promo_page)
-        block = page_to_block(soup, market, page_url)  # soup-u dəyişir, sonda çağırılır
+        out["structured"] += extract_cards_generic(soup, market, base, promo_page)
+        if market not in ("Bazarstore", "Araz") and (promo_page or page_url == url):
+            out["vision"] += collect_promo_images(soup, base, market, VISION_PER_MARKET)
+        block = page_to_block(soup, market, page_url, base)  # soup-u dəyişir, sonda çağırılır
         if block:
             out["blocks"].append(block)
         STATS["web_pages"] += 1
+    out["vision"] = out["vision"][:VISION_PER_MARKET]
     out["telegram"] = tg.get("slug", "")
-    log.info("  [Veb] %s: %d səhifə, %d strukturlu məhsul, ig=%s fb=%s tg=%s", market, len(pages), len(out["structured"]),
-             bool(out["socials"].get("ig")), bool(out["socials"].get("fb")), out["telegram"] or "-")
+    log.info("  [Veb] %s: %d səhifə, %d məhsul kartı, %d promo şəkil, ig=%s fb=%s tg=%s", market, len(pages), len(out["structured"]),
+             len(out["vision"]), bool(out["socials"].get("ig")), bool(out["socials"].get("fb")), out["telegram"] or "-")
     return out
 
 
-def scrape_market_websites() -> tuple[list[dict], list[dict], dict, dict]:
+def scrape_market_websites() -> tuple[list[dict], list[dict], dict, dict, list[dict]]:
     socials = {k: dict(v) for k, v in DEFAULT_SOCIAL_URLS.items()}
     telegram = dict(TELEGRAM_CHANNELS)
-    blocks, structured = [], []
+    blocks, structured, vision = [], [], []
     with ThreadPoolExecutor(max_workers=5) as pool:
         results = list(pool.map(lambda m: scrape_one_market(m[0], m[1]), MARKET_WEBSITES))
     for res in results:
         blocks += res["blocks"]
         structured += res["structured"]
+        vision += res["vision"]
         if res["socials"]:
             socials.setdefault(res["market"], {}).update(res["socials"])  # saytdan tapılan rəsmi ünvan üstünlük qazanır
         if res["telegram"]:
@@ -673,7 +760,210 @@ def scrape_market_websites() -> tuple[list[dict], list[dict], dict, dict]:
             m, slug = pair.split(":", 1)
             telegram[m.strip()] = slug.strip().lstrip("@")
     STATS["structured"] = len(structured)
-    return blocks, structured, socials, telegram
+    return blocks, structured, socials, telegram, vision
+
+
+# --------------------------------------------------------------------------- saytlara xas çıxarıcılar
+CATEGORY_RULES = [
+    ("Süd məhsulları", ("süd", "sud ", "qatıq", "qatiq", "pendir", "kərə yağ", "kefir", "qaymaq", "yoqurt", "ayran", "kəsmik")),
+    ("İçkilər", ("kola", "cola", "su ", "şirə", "sirə", "içki", "fanta", "limonad", "sprite", "pepsi", "çay", "qəhvə",
+                 "kofe", "nescafe", "enerji", "mineral", "gaz")),
+    ("Təmizlik", ("yuyucu", "sabun", "fairy", "bulaşıq", "təmizl", "ağardıcı", "agardici", "tualet", "kağız", "salfet",
+                  "şampun", "pampers", "dəsmal", "maye", "mayesi")),
+    ("Şirniyyat", ("şokolad", "konfet", "peçenye", "vafli", "tort", "biskvit", "dondurma", "marmelad", "halva", "paxlava")),
+]
+UNIT_RE = re.compile(r"(\d+(?:[.,]\d+)?\s?(?:kq|kg|qr|gr|ml|litr|lt|ədəd|əd)\b|\d+(?:[.,]\d+)?\s?[lLqQgG]\b|\bKQ\b)", re.I)
+BAD_IMG_RE = re.compile(r"logo|icon|favicon|sprite|flag|avatar|arrow|header|footer|wolt|facebook\.com/tr|yandex|linkedin|"
+                        r"placeholder|noimage|no-image|banner-app|app-download|\.svg|\.gif", re.I)
+
+
+def tr_title(text: str) -> str:
+    """BÜTÖV BÖYÜK HƏRFLƏ yazılmış adı oxunaqlı hala salır (Azərbaycan/Türk i-İ qaydası ilə)."""
+    if not text or not text.isupper():
+        return text
+    low = text.replace("İ", "i").replace("I", "ı").lower()
+    words = []
+    for w in low.split(" "):
+        if w in ("kq", "ml", "qr", "gr", "st", "l"):
+            words.append(w.upper() if w in ("kq", "ml", "qr", "gr", "st") else w.upper())
+        elif w:
+            first = "İ" if w[0] == "i" else ("I" if w[0] == "ı" else w[0].upper())
+            words.append(first + w[1:])
+    return " ".join(words)
+
+
+def guess_category(name: str) -> str:
+    low = (name or "").lower() + " "
+    for cat, kws in CATEGORY_RULES:
+        if any(k in low for k in kws):
+            return cat
+    return "Ərzaq"
+
+
+def guess_unit(name: str) -> str:
+    m = UNIT_RE.search(name or "")
+    if not m:
+        return "1 ədəd"
+    u = m.group(1).strip()
+    return "1 kq" if u.lower() == "kq" else u
+
+
+def price_in(text: str):
+    m = re.search(r"(\d+(?:[.,]\d{1,2})?)", text or "")
+    return safe_float(m.group(1)) if m else None
+
+
+def img_of(el, base: str) -> str:
+    """Elementdəki real məhsul şəklini tapır (lazy-load daxil), loqo/boş şəkilləri atır."""
+    for im in el.find_all("img"):
+        for attr in ("data-lazyloadsrc", "data-src", "data-lazy-src", "data-original", "src"):
+            src = im.get(attr) or ""
+            if src and not src.startswith("data:") and not BAD_IMG_RE.search(src):
+                url = urljoin(base, src)
+                if url.startswith("https://"):
+                    return url
+    return ""
+
+
+def parse_bazarstore_page(html: str) -> list[dict]:
+    items = []
+    soup = BeautifulSoup(html, "html.parser")
+    for card in soup.select(".product-item"):
+        title = card.select_one(".product-title")
+        name = title.get_text(" ", strip=True) if title else ""
+        actual = card.select_one(".actual-price")
+        old = card.select_one(".old-price")
+        price = price_in(actual.get_text() if actual else (card.select_one(".price").get_text() if card.select_one(".price") else ""))
+        if not name or not price:
+            continue
+        items.append({
+            "name": tr_title(name), "price": price,
+            "oldPrice": price_in(old.get_text()) if old else None, "market": "Bazarstore", "source": "Veb sayt",
+            "imageUrl": img_of(card, "https://bazarstore.az/"), "category": guess_category(name), "unit": guess_unit(name),
+        })
+    return items
+
+
+def scrape_bazarstore() -> list[dict]:
+    """Bazarstore endirimli məhsullar səhifəsi (hər səhifədə köhnə + yeni qiymət və şəkil var)."""
+    base = "https://bazarstore.az/endirimli-m%C9%99hsullar"
+    first = parse_bazarstore_page(fetch_html(base + "?pagesize=60", timeout=25))
+    size_param = "&pagesize=60" if len(first) > 6 else ""
+    if not size_param:
+        first = parse_bazarstore_page(fetch_html(base, timeout=25))
+    if not first:
+        return []
+    per_page = len(first)
+    pages = min(-(-BAZAR_MAX // per_page), 45)
+
+    def one(n):
+        return parse_bazarstore_page(fetch_html(f"{base}?pagenumber={n}{size_param}", timeout=25))
+
+    items = list(first)
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        for chunk in pool.map(one, range(2, pages + 1)):
+            items += chunk
+    uniq = {}
+    for it in items:
+        uniq.setdefault(normalize_key(it["name"]), it)
+    out = list(uniq.values())[:BAZAR_MAX]
+    STATS["bazar"] = len(out)
+    log.info("  [Bazarstore] %d endirimli məhsul (səhifə başına %d, %d səhifə)", len(out), per_page, pages)
+    return out
+
+
+def scrape_araz() -> list[dict]:
+    """Araz-ın öz API-si (sayt bu məlumatı JS ilə yükləyir): endirimli və 'wow' kampaniya məhsulları."""
+    host = "b7x9kq.arazmarket.az"
+    html = fetch_html("https://www.arazmarket.az/", timeout=25)
+    m = re.search(r"https://([\w-]+\.arazmarket\.az)/storage", html or "")
+    if m:
+        host = m.group(1)
+    try:
+        data = SESSION.get(f"https://{host}/api/home", timeout=25).json().get("data", {})
+    except Exception as exc:
+        log.warning("  [Araz API] %s", type(exc).__name__)
+        return []
+    out = []
+    for key in ("discount_products", "wow_campaign_products", "products_of_the_day"):
+        for p in data.get(key) or []:
+            if not isinstance(p, dict) or not p.get("is_discount"):
+                continue
+            price, old = safe_float(p.get("discount_price")), safe_float(p.get("sales_price"))
+            imgs = p.get("images") or []
+            first = imgs[0] if imgs else ""
+            img = first.get("url") if isinstance(first, dict) else first
+            if not price or not p.get("title"):
+                continue
+            out.append({
+                "name": p["title"], "price": price, "oldPrice": old, "market": "Araz", "source": "Veb sayt",
+                "imageUrl": img if isinstance(img, str) and img.startswith("https://") else "",
+                "category": guess_category(f"{p['title']} {p.get('category_title') or ''}"), "unit": guess_unit(p["title"]),
+            })
+    uniq = {}
+    for it in out:
+        uniq.setdefault(normalize_key(it["name"]), it)
+    STATS["araz"] = len(uniq)
+    log.info("  [Araz API] %d endirimli məhsul", len(uniq))
+    return list(uniq.values())
+
+
+def extract_cards_generic(soup, market: str, base: str, promo_page: bool) -> list[dict]:
+    """Ümumi məhsul kartı çıxarıcısı: başlıq + şəkil + ₼ qiymət olan ən kiçik blokları tapır."""
+    if len(str(soup)) > 700_000:
+        return []
+    price_re = re.compile(r"(\d+(?:[.,]\d{1,2})?)\s*(?:₼|AZN|azn)")
+    cands = []
+    for el in soup.find_all(["div", "li", "article", "a"]):
+        txt = el.get_text(" ", strip=True)
+        if not txt or len(txt) > 400 or not price_re.search(txt) or el.find("img") is None:
+            continue
+        cands.append(el)
+    cand_ids = {id(c) for c in cands}
+    out = []
+    for el in cands:
+        if any(id(d) in cand_ids for d in el.find_all(["div", "li", "article", "a"])):
+            continue  # daha kiçik uyğun blok var
+        head = el.find(re.compile(r"^h[1-6]$")) or el.select_one('[class*="title"], [class*="name"]')
+        name = head.get_text(" ", strip=True) if head else (el.find("img").get("alt") or "").strip()
+        if not name or len(name) < 3 or price_re.search(name):
+            continue
+        old_el = el.select_one('del, s, strike, [class*="old"], [class*="through"]')
+        old = price_in(old_el.get_text()) if old_el else None
+        prices = [safe_float(x.replace(",", ".")) for x in price_re.findall(el.get_text(" ", strip=True))]
+        prices = [x for x in prices if x]
+        if not prices:
+            continue
+        price = min(prices)
+        if old is None and len(prices) >= 2 and max(prices) > price:
+            old = max(prices)
+        if old is None and not promo_page:
+            continue  # endirim əlaməti yoxdur
+        out.append({"name": name, "price": price, "oldPrice": old, "market": market, "source": "Veb sayt",
+                    "imageUrl": img_of(el, base), "category": guess_category(name), "unit": guess_unit(name)})
+    STATS["cards"] += len(out)
+    return out[:80]
+
+
+def collect_promo_images(soup, base: str, market: str, limit: int) -> list[dict]:
+    """Aksiya/kataloq şəkilləri (qiymət şəkildə yazılır) — Vision AI ilə oxunacaq."""
+    seen, out = set(), []
+    for im in soup.find_all("img"):
+        src = ""
+        for attr in ("data-lazyloadsrc", "data-src", "data-lazy-src", "src"):
+            v = im.get(attr) or ""
+            if v and not v.startswith("data:"):
+                src = v
+                break
+        if not src or BAD_IMG_RE.search(src):
+            continue
+        url = urljoin(base, src)
+        if url.startswith("https://") and url not in seen:
+            seen.add(url)
+            out.append({"market": market, "source": "Veb sayt", "imageUrl": url})
+        if len(out) >= limit:
+            break
+    return out
 
 
 # --------------------------------------------------------------------------- Apify (Instagram, Facebook)
@@ -785,37 +1075,50 @@ def scrape_telegram_channels(channels: dict) -> tuple[list[dict], list[dict]]:
 
 
 # --------------------------------------------------------------------------- Vision AI
+def download_image_part(url: str):
+    try:
+        r = SESSION.get(url, timeout=12)
+        if r.status_code != 200 or len(r.content) > 4_500_000 or len(r.content) < 3000:
+            return None
+        mime = (r.headers.get("Content-Type") or "image/jpeg").split(";")[0].strip().lower()
+        if mime not in ("image/jpeg", "image/png", "image/webp"):
+            mime = "image/jpeg"
+        return types.Part.from_bytes(data=r.content, mime_type=mime)
+    except Exception:
+        return None
+
+
 def extract_from_promo_images_vision(client, candidates: list[dict]) -> list[dict]:
-    extracted, seen = [], set()
+    """Aksiya şəkillərini (Instagram, Facebook, Telegram, sayt) Gemini Vision ilə oxuyur; bir sorğuda bir neçə şəkil."""
+    seen, by_market = set(), {}
     for cand in candidates:
         url = cand.get("imageUrl")
-        if not url or url in seen:
+        if not url or url in seen or len(seen) >= VISION_MAX:
             continue
         seen.add(url)
-        if len(seen) > VISION_MAX:
-            break
-        try:
-            r = SESSION.get(url, timeout=12)
-            if r.status_code != 200 or len(r.content) > 4_500_000:
+        by_market.setdefault((cand["market"], cand.get("source", "Sosial şəbəkə")), []).append(url)
+
+    extracted = []
+    for (market, source), urls in by_market.items():
+        for i in range(0, len(urls), VISION_PER_CALL):
+            parts = [x for x in (download_image_part(u) for u in urls[i:i + VISION_PER_CALL]) if x is not None]
+            if not parts:
                 continue
-            mime = (r.headers.get("Content-Type") or "image/jpeg").split(";")[0].strip().lower()
-            if mime not in ("image/jpeg", "image/png", "image/webp"):
-                mime = "image/jpeg"
-            part = types.Part.from_bytes(data=r.content, mime_type=mime)
             prompt = (
-                f"Bu {cand['market']} marketinin sosial şəbəkə endirim paylaşımıdır. "
-                "Şəkildə konkret qiyməti (AZN / ₼) görünən bütün məhsulları YALNIZ JSON massivi kimi qaytar: "
+                f"Bu şəkillər {market} marketinin endirim/aksiya paylaşımlarıdır. "
+                "Şəkillərdə konkret qiyməti (AZN / ₼) görünən bütün məhsulları YALNIZ JSON massivi kimi qaytar: "
                 '[{"name": "...", "category": "Ərzaq", "oldPrice": 3.5, "price": 2.49, "unit": "1 ədəd", "endDate": "2026-12-31"}]. '
-                "endDate yalnız şəkildə yazılıbsa (YYYY-MM-DD). Qiymət yoxdursa [] qaytar. Heç nə uydurma."
+                "name — marka və həcm/çəki ilə tam ad. endDate yalnız şəkildə yazılıbsa (YYYY-MM-DD). "
+                "Qiymət yoxdursa [] qaytar. Heç nə uydurma."
             )
-            STATS["vision_images"] += 1
-            for item in extract_json_array(gemini_text(client, [prompt, part])):
-                if isinstance(item, dict) and item.get("name") and item.get("price"):
-                    item["market"] = cand["market"]
-                    item["source"] = cand.get("source", "Sosial şəbəkə")
-                    extracted.append(item)
-        except Exception as exc:
-            log.warning("  [Vision xətası] %s: %s", cand.get("market"), exc)
+            try:
+                STATS["vision_images"] += len(parts)
+                for item in extract_json_array(gemini_text(client, [prompt] + parts)):
+                    if isinstance(item, dict) and item.get("name") and item.get("price"):
+                        item["market"], item["source"] = market, source
+                        extracted.append(item)
+            except Exception as exc:
+                log.warning("  [Vision xətası] %s: %s", market, str(exc)[:160])
     log.info("  [Vision AI] %d şəkildən %d məhsul oxundu", STATS["vision_images"], len(extracted))
     return extracted
 
@@ -905,8 +1208,8 @@ def clean_item(it: dict, today: str) -> dict | None:
             return None  # bitmiş endirim
         end_date = raw_end
     cat = clean_text(it.get("category"), 30)
-    if cat not in ALLOWED_CATEGORIES:
-        cat = "Ərzaq"
+    if cat not in ALLOWED_CATEGORIES or cat == "Ərzaq":
+        cat = guess_category(name) if cat in ("", "Ərzaq") or cat not in ALLOWED_CATEGORIES else cat
     key = normalize_key(name)
     if not key:
         return None
@@ -971,16 +1274,32 @@ def build_products(raw_items: list[dict], prev_items: list[dict], image_cache: d
         for e, ok in pool.map(check, [e for e in entry_list if e["imageUrl"]]):
             if not ok:
                 e["imageUrl"] = ""
+    pool_imgs = [(name_tokens(e["name"]), e["imageUrl"]) for e in entry_list if e["imageUrl"]]
+
+    def similar_image(e):
+        """Eyni məhsulun başqa marketdəki öz şəkli (ad uyğunluğu ≥75%) varsa onu götür."""
+        tk = name_tokens(e["name"])
+        best, score = "", 0.0
+        for t2, url in pool_imgs:
+            if not tk or not t2:
+                continue
+            j = len(tk & t2) / float(len(tk | t2))
+            if j > score:
+                best, score = url, j
+        return best if score >= 0.75 else ""
+
     searched = 0
     for e in sorted(entry_list, key=lambda x: x["price"]):
         if e["imageUrl"]:
             e["imgSrc"] = e.get("imgSrc") or "source"
             continue
         prev = prev_index.get(f"{e['key']}|{e['market']}")
-        if prev and prev.get("imageUrl") and prev.get("imgSrc") in ("source", "verified"):
+        if prev and prev.get("imageUrl") and prev.get("imgSrc") in ("source", "verified", "matched"):
             e["imageUrl"], e["imgSrc"] = prev["imageUrl"], prev["imgSrc"]   # yalnız yoxlanmış şəkil təkrar istifadə olunur
         elif (image_cache.get(e["key"]) or "").startswith("https://"):
             e["imageUrl"], e["imgSrc"] = image_cache[e["key"]], "verified"
+        elif similar_image(e):
+            e["imageUrl"], e["imgSrc"] = similar_image(e), "matched"
         elif searched < IMAGE_SEARCH_MAX:
             url = find_high_quality_product_image(e["name"], image_cache, client, today)
             if url:
@@ -1026,18 +1345,34 @@ def build_products(raw_items: list[dict], prev_items: list[dict], image_cache: d
 
 
 # --------------------------------------------------------------------------- cashback
+CB_GOOD = re.compile(r"kesbek|keshbek|keşbək|cashback|bonus|market|kart", re.I)
+CB_BAD = re.compile(r"atm|location|branch|filial|news|xeber|blog|youtube|facebook|instagram|vakans|career|\.pdf$", re.I)
+
+
 def find_bank_page(bank: str, domain: str) -> str:
+    """Bankın rəsmi cashback səhifəsini axtarır; yalnız öz domenində və cashback sözü olan ünvanı qəbul edir."""
     if DDGS is None:
         return ""
-    try:
-        time.sleep(0.6)
-        for r in DDGS().text(f"site:{domain} market keşbek", max_results=4) or []:
+    best, best_score = "", 0
+    for q in (f"{bank} market keşbək kart", f"{bank} cashback kartlar", f"{bank} keşbək"):
+        try:
+            time.sleep(0.6)
+            results = DDGS().text(q, max_results=8) or []
+        except Exception:
+            continue
+        for r in results:
             href = r.get("href") or ""
-            if href.startswith("https://") and domain in urlparse(href).netloc:
-                return href
-    except Exception as exc:
-        log.warning("  [Bank axtarışı] %s: %s", bank, exc)
-    return ""
+            host = urlparse(href).netloc.lower()
+            if not href.startswith("https://") or domain not in host or CB_BAD.search(href):
+                continue
+            score = len(CB_GOOD.findall(href)) * 2 + (1 if re.search(r"kesbek|cashback", href, re.I) else 0)
+            if urlparse(href).path.strip("/") in ("", "az", "en", "ru"):
+                score = 0   # ana səhifə
+            if score > best_score:
+                best, best_score = href, score
+        if best_score >= 3:
+            break
+    return best
 
 
 def build_cashback_sources() -> list[tuple[str, str]]:
@@ -1185,9 +1520,10 @@ def main():
         raise RuntimeError("GEMINI_API_KEY gizli açarı tapılmadı.")
     if genai is None:
         raise RuntimeError("google-genai paketi quraşdırılmayıb.")
-    apify_token = os.environ.get("APIFY_TOKEN", "").strip()
+    apify_token = os.environ.get("APIFY_TOKEN", "").strip() if os.environ.get("USE_APIFY", "1").strip() != "0" else ""
 
     client = genai.Client(api_key=api_key)
+    pick_models(client)
     db = None if dry else init_firestore()
     now = datetime.now(BAKU_TZ)
     today, now_label = now.strftime("%Y-%m-%d"), now.strftime("%d.%m.%Y %H:%M")
@@ -1206,7 +1542,9 @@ def main():
     write_doc(db, "brand_assets", {"updatedLabel": f"Yeniləndi: {now_label}", "version": LOGO_VERSION, "logos": collect_brand_logos(existing_logos)}, dry)
 
     log.info("2. Market saytları skan edilir (endirim səhifələri avtomatik tapılır)...")
-    web_blocks, structured, socials, tg_channels = scrape_market_websites()
+    web_blocks, structured, socials, tg_channels, web_vision = scrape_market_websites()
+    log.info("2b. Bazarstore və Araz endirim məlumatları (API/səhifələr)...")
+    structured += scrape_bazarstore() + scrape_araz()
 
     ig_blocks, ig_vision, fb_blocks, fb_vision = [], [], [], []
     if apify_token:
@@ -1222,7 +1560,7 @@ def main():
     total_sources = len(web_blocks) + len(ig_blocks) + len(fb_blocks) + len(tg_blocks) + len(structured)
 
     log.info("5. Vision AI və Gemini analizi aparılır...")
-    vision_items = extract_from_promo_images_vision(client, ig_vision + fb_vision + tg_vision)
+    vision_items = extract_from_promo_images_vision(client, web_vision + ig_vision + fb_vision + tg_vision)
     text_blocks = web_blocks + ig_blocks[:40] + fb_blocks[:40] + tg_blocks
     gemini_items = gemini_extract_products(client, text_blocks) if text_blocks else []
     # Yalnız saytda həqiqətən olan və adı məhsula uyğun gələn şəkillər qəbul edilir (Gemini şəkil uydura bilər)
@@ -1236,7 +1574,7 @@ def main():
         else:
             it["imageUrl"] = ""
     raw_items = structured + vision_items + gemini_items
-    log.info("  Xam məhsul: strukturlu %d + Vision %d + Gemini %d", len(structured), len(vision_items), len(gemini_items))
+    log.info("  Xam məhsul: sayt/API %d + Vision %d + Gemini %d", len(structured), len(vision_items), len(gemini_items))
 
     products, drops = build_products(raw_items, prev_items, image_cache, today, client)
     with_img = sum(1 for p in products if p.get("imageUrl"))
