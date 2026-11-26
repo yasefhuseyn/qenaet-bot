@@ -190,7 +190,7 @@ _dead_models: set = set()      # bu işləmədə 404/kvota bitmiş modellər tə
 _cool_until: dict = {}         # həddən artıq yüklənmiş modellər müvəqqəti gözləyir
 
 STATS = {"bazar": 0, "araz": 0, "cards": 0, "image_verified": 0, "web_pages": 0, "structured": 0, "ig_posts": 0, "fb_posts": 0, "tg_posts": 0,
-         "vision_images": 0, "gemini_calls": 0, "gemini_errors": 0, "image_searches": 0}
+         "vision_images": 0, "gemini_calls": 0, "gemini_errors": 0, "image_searches": 0, "brand_verified": 0}
 
 
 # --------------------------------------------------------------------------- ümumi köməkçilər
@@ -571,7 +571,56 @@ def logo_candidates(domain: str) -> list[str]:
     return out
 
 
-def collect_brand_logos(existing_logos: dict) -> dict:
+def search_verified_brand_image(client, name: str, kind: str) -> str:
+    """İnternetdə (Bing) loqo / bank kartı şəkli axtarır; yalnız Gemini təsdiqlədikdə qəbul edir."""
+    if DDGS is None or client is None or types is None:
+        return ""
+    query = f"{name} rəsmi loqo logo" if kind == "logo" else f"{name} bank card debit credit card design"
+    try:
+        time.sleep(0.5)
+        results = DDGS().images(query, max_results=12, backend="bing") or []
+    except Exception as exc:
+        log.debug("  [Brend şəkil axtarışı] %s: %s", name, type(exc).__name__)
+        return ""
+    base = name.lower().split()[0]
+    cands = []
+    for it in results:
+        url = it.get("image") or ""
+        w, h = int(it.get("width") or 0), int(it.get("height") or 0)
+        if not url.startswith("https://") or BAD_IMG_RE.search(url.replace(".svg", "")) and kind == "card":
+            continue
+        if w and h and (w < 120 or h < 120):
+            continue
+        ratio = (w / float(h)) if w and h else 1.0
+        if kind == "logo" and not (0.6 <= ratio <= 1.7):
+            continue
+        if kind == "card" and not (1.2 <= ratio <= 2.0):
+            continue
+        rel = 1 if (base in url.lower() or base in (it.get("title") or "").lower()) else 0
+        cands.append((rel, w * h, url))
+    cands.sort(reverse=True)
+    for _, _, url in cands[:4]:
+        try:
+            r = SESSION.get(url, timeout=10)
+            mime = (r.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+            if r.status_code != 200 or len(r.content) > 3_000_000 or mime not in ("image/jpeg", "image/png", "image/webp"):
+                continue
+            if kind == "logo":
+                q = (f'Bu şəkil "{name}" şirkətinin (Azərbaycan) rəsmi loqosudur? Tək loqo olmalı, fon/şəkil/məhsul/ekran görüntüsü olmamalıdır. '
+                     'YALNIZ JSON: {"match": true} və ya {"match": false}')
+            else:
+                q = (f'Bu şəkil "{name}" bankının plastik ödəniş kartının (debet/kredit) təmiz görüntüsüdürmü? '
+                     'Bank adı/loqosu kartda uyğun olmalıdır; insan, təsvirsiz fon, bannerdə mətn və ya başqa bank olarsa uyğun DEYİL. '
+                     'YALNIZ JSON: {"match": true} və ya {"match": false}')
+            STATS["brand_verified"] += 1
+            if extract_json_object(gemini_text(client, [q, types.Part.from_bytes(data=r.content, mime_type=mime)])).get("match") is True:
+                return url
+        except Exception:
+            continue
+    return ""
+
+
+def collect_brand_logos(existing_logos: dict, client=None) -> dict:
     logos = dict(existing_logos or {})
     brands = [(m, dom) for m, _, dom in MARKET_WEBSITES]
     brands += [(b, dom) for b, _, dom in CASHBACK_SOURCES if b != "FED.az"]
@@ -589,8 +638,12 @@ def collect_brand_logos(existing_logos: dict) -> dict:
                 return name, cand
         return name, ""
 
+    def find_with_search(item):
+        n, u = find(item)
+        return (n, u) if u else (n, search_verified_brand_image(client, item[0], "logo"))
+    find_fn = find_with_search if client is not None else find
     with ThreadPoolExecutor(max_workers=6) as pool:
-        for name, url in pool.map(find, todo):
+        for name, url in pool.map(find_fn, todo):
             if url:
                 logos[name] = url
             else:
@@ -1543,8 +1596,16 @@ def main():
     assets = read_doc(db, "brand_assets")
     existing_logos = dict(assets.get("logos", {})) if assets.get("version") == LOGO_VERSION else {}
 
+    card_images = {k: v for k, v in dict(assets.get("cards", {})).items() if isinstance(v, str) and v.startswith("https://")}
+    for bank in BANK_GRADIENTS:
+        if bank not in card_images:
+            u = search_verified_brand_image(client, bank, "card")
+            if u:
+                card_images[bank] = u
+            else:
+                log.warning("  [Kart şəkli] %s üçün uyğun şəkil tapılmadı", bank)
     log.info("1. Market və bank loqoları yoxlanılır...")
-    write_doc(db, "brand_assets", {"updatedLabel": f"Yeniləndi: {now_label}", "version": LOGO_VERSION, "logos": collect_brand_logos(existing_logos)}, dry)
+    write_doc(db, "brand_assets", {"updatedLabel": f"Yeniləndi: {now_label}", "version": LOGO_VERSION, "logos": collect_brand_logos(existing_logos, client), "cards": card_images}, dry)
 
     log.info("2. Market saytları skan edilir (endirim səhifələri avtomatik tapılır)...")
     web_blocks, structured, socials, tg_channels, web_vision = scrape_market_websites()
@@ -1594,6 +1655,9 @@ def main():
 
     log.info("6. Bank cashback-ləri yenilənir...")
     cards = analyze_cashbacks_with_gemini(client)
+    for c in cards:
+        if card_images.get(c["bank"]):
+            c["cardImage"] = card_images[c["bank"]]
     log.info("Yenilənən bank kartı sayı: %d", len(cards))
     cb_changes = []
     if len(cards) >= 5:
