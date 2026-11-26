@@ -1447,7 +1447,7 @@ def clean_item(it: dict, today: str) -> dict | None:
 
 def size_sig(name: str):
     """Çəki/həcmi qram/ml-ə çevirir (500 qr, 0.5 kq, 1 L ...)."""
-    m = re.search(r"(\d+(?:[.,]\d+)?)\s?(kq|kg|qr|gr|g|ml|litr|lt|l)\b", (name or "").lower())
+    m = re.search(r"(\d+(?:[.,]\d+)?)\s?(kq|kg|qr|gr|g|q|ml|litr|lt|l)\b", (name or "").lower().replace("ı", "i"))
     if not m:
         return None
     v = float(m.group(1).replace(",", "."))
@@ -1455,7 +1455,8 @@ def size_sig(name: str):
 
 
 def core_tokens(name: str) -> set:
-    return {t for t in name_tokens(name) if not t.isdigit() and t not in ("litr", "kiloqram", "qram", "paket", "ədəd", "bahalı")}
+    folded = (name or "").lower().replace("ı", "i").replace("i̇", "i")
+    return {t for t in name_tokens(folded) if not t.isdigit() and t not in ("litr", "lt", "kiloqram", "qram", "paket", "ədəd", "bahalı", "yağlı", "yagli", "ml", "gr")}
 
 
 def same_product(a: dict, b: dict) -> bool:
@@ -1556,6 +1557,8 @@ def build_products(raw_items: list[dict], prev_items: list[dict], image_cache: d
             for (hk0, g), found in zip(todo[:BAZAR_LOOKUP_MAX], pool.map(lambda t: bazar_regular_lookup(t[1][0]["name"]), todo[:BAZAR_LOOKUP_MAX])):
                 if found:
                     extra_comps[hk0] = {"market": "Bazarstore", "price": found["price"], "isPromo": bool(found.get("oldPrice"))}
+                elif len(extra_comps) < 3:
+                    log.info("  [Bazar axtarış] tapılmadı: %s", g[0]["name"])
         log.info("  Bazarstore qiymət müqayisəsi: %d məhsul üçün tapıldı", len(extra_comps))
 
     # 5. Şəkillər: öz şəkli → əvvəlki şəkil → keş → internet axtarışı
