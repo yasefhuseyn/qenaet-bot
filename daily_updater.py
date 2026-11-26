@@ -119,7 +119,6 @@ MARKET_WEBSITES = [
     ("Grandmart", "https://www.grandmartsupermarket.com/", "grandmartsupermarket.com"),
     ("Bolmart", "https://www.bolmart.az/", "bolmart.az"),
     ("Tamstore", "https://tamstore.az/", "tamstore.az"),
-    ("Spar", "https://spar-international.com/country/azerbaijan-2/", "spar-international.com"),
 ]
 
 # Rəsmi saytlardan avtomatik tapılmazsa ehtiyat ünvanlar
@@ -172,12 +171,12 @@ BANK_GRADIENTS = {
 }
 DEFAULT_GRADIENT = "from-slate-700 via-slate-800 to-slate-950"
 
-EXCLUDED_MARKETS = {"Neptun"}
-CANONICAL_MARKETS = ["Bravo", "Araz", "Bazarstore", "Rahat", "OBA", "AL Market", "Grandmart", "Spar", "Bolmart", "Tamstore"]
+EXCLUDED_MARKETS = {"Spar", "Neptun"}
+CANONICAL_MARKETS = ["Bravo", "Araz", "Bazarstore", "Rahat", "OBA", "AL Market", "Grandmart", "Bolmart", "Tamstore"]
 MARKET_ALIASES = {
     "bravo": "Bravo", "araz": "Araz", "bazar": "Bazarstore", "rahat": "Rahat", "oba": "OBA",
     "almarket": "AL Market", "al market": "AL Market", "al-market": "AL Market",
-    "grandmart": "Grandmart", "grand mart": "Grandmart", "spar": "Spar", "bolmart": "Bolmart", "bol mart": "Bolmart",
+    "grandmart": "Grandmart", "grand mart": "Grandmart", "bolmart": "Bolmart", "bol mart": "Bolmart",
 }
 ALLOWED_CATEGORIES = ("Süd məhsulları", "Ərzaq", "İçkilər", "Təmizlik", "Şirniyyat")
 PROMO_KEYWORDS = ("endirim", "aksiya", "kampaniya", "special", "promo", "offer", "discount", "kataloq",
@@ -1397,7 +1396,7 @@ def gemini_extract_products(client, blocks: list[dict]) -> list[dict]:
             "3. endDate yalnız mətndə bitmə tarixi yazılıbsa (YYYY-MM-DD), yoxdursa boş burax.\n"
             "4. imageUrl yalnız veb sayt blokundakı `images` siyahısından tək məhsulun şəkli ola bilər; "
             "toplu kataloq/post şəkillərini yazma.\n"
-            "5. market: Bravo, Araz, Bazarstore, Rahat, OBA, AL Market, Grandmart, Spar, Bolmart.\n"
+            "5. market: Bravo, Araz, Bazarstore, Rahat, OBA, AL Market, Grandmart, Bolmart.\n"
             "6. YALNIZ JSON massivi qaytar (maksimum 60 məhsul). Sahələr: name, category "
             '("Süd məhsulları"|"Ərzaq"|"İçkilər"|"Təmizlik"|"Şirniyyat"), market, '
             'source ("Instagram"|"Facebook"|"Veb sayt"|"Telegram kanalı"), oldPrice, price, unit, imageUrl, endDate.\n\n'
