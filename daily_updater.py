@@ -665,7 +665,7 @@ def find_brand_image(client, name: str, kind: str) -> str:
     return search_verified_brand_image(client, name, kind)
 
 
-def search_verified_brand_image(client, name: str, kind: str) -> str:
+def search_verified_brand_image(client, name: str, kind: str, extra: str = "") -> str:
     """İnternetdə (Bing) loqo / bank kartı şəkli axtarır; yalnız Gemini təsdiqlədikdə qəbul edir."""
     if DDGS is None or client is None or types is None:
         return ""
@@ -673,7 +673,8 @@ def search_verified_brand_image(client, name: str, kind: str) -> str:
     if kind == "logo":
         queries = [f"{name} {'supermarket ' if is_market else 'bank '}Azerbaijan logo", f"{name} loqo az"]
     else:
-        queries = [f"{name} Azərbaycan bank kartı", f"{name} bank card Azerbaijan visa mastercard"]
+        queries = ([f"{name} {extra} kartı", f"{name} {extra} card"] if extra else
+                   [f"{name} Azərbaycan bank kartı", f"{name} bank card Azerbaijan visa mastercard"])
     results = []
     for query in queries:
         try:
@@ -715,12 +716,12 @@ def search_verified_brand_image(client, name: str, kind: str) -> str:
                 q = (f'Bu şəkil "{name}" şirkətinin (Azərbaycan) rəsmi loqosudur? Tək loqo olmalı, fon/şəkil/məhsul/ekran görüntüsü olmamalıdır. '
                      'YALNIZ JSON: {"match": true} və ya {"match": false}')
             else:
-                q = (f'Bu şəkil "{name}" bankının plastik ödəniş kartının (debet/kredit) təmiz görüntüsüdürmü? '
+                q = (f'Bu şəkil "{name} {extra}" bank kartının (debet/kredit) təmiz görüntüsüdürmü? '
                      'Bank adı/loqosu kartda uyğun olmalıdır; insan, təsvirsiz fon, bannerdə mətn və ya başqa bank olarsa uyğun DEYİL. '
                      'YALNIZ JSON: {"match": true} və ya {"match": false}')
             STATS["brand_verified"] += 1
             ok = extract_json_object(gemini_text(client, [q, types.Part.from_bytes(data=r.content, mime_type=mime)])).get("match") is True
-            log.info("  [Brend yoxlama] %s → %s %s", name, "OK" if ok else "uyğun deyil", url[:90])
+            log.info("  [Brend yoxlama] %s %s → %s %s", name, extra, "OK" if ok else "uyğun deyil", url[:90])
             if ok:
                 return url
         except Exception as exc:
@@ -1716,7 +1717,8 @@ def main():
             else:
                 log.warning("  [Kart şəkli] %s üçün uyğun şəkil tapılmadı", bank)
     log.info("1. Market və bank loqoları yoxlanılır...")
-    write_doc(db, "brand_assets", {"updatedLabel": f"Yeniləndi: {now_label}", "version": LOGO_VERSION, "logos": collect_brand_logos(existing_logos, client), "cards": card_images}, dry)
+    brand_logos = collect_brand_logos(existing_logos, client)
+    write_doc(db, "brand_assets", {"updatedLabel": f"Yeniləndi: {now_label}", "version": LOGO_VERSION, "logos": brand_logos, "cards": card_images}, dry)
 
     log.info("2. Market saytları skan edilir (endirim səhifələri avtomatik tapılır)...")
     web_blocks, structured, socials, tg_channels, web_vision = scrape_market_websites()
@@ -1766,9 +1768,19 @@ def main():
 
     log.info("6. Bank cashback-ləri yenilənir...")
     cards = analyze_cashbacks_with_gemini(client)
-    for c in cards:
-        if card_images.get(c["bank"]):
+    for c in cards[:30]:
+        ckey = f"{c['bank']}|{c['cardName']}"
+        if not card_images.get(ckey):
+            u = search_verified_brand_image(client, c["bank"], "card", extra=c["cardName"])
+            if u:
+                card_images[ckey] = u
+                log.info("  [Kart şəkli] %s — %s: dəqiq şəkil tapıldı", c["bank"], c["cardName"])
+        if card_images.get(ckey):
+            c["cardImage"] = card_images[ckey]
+        elif card_images.get(c["bank"]):
             c["cardImage"] = card_images[c["bank"]]
+    if not dry:
+        write_doc(db, "brand_assets", {"updatedLabel": f"Yeniləndi: {now_label}", "version": LOGO_VERSION, "logos": brand_logos, "cards": card_images}, dry)
     log.info("Yenilənən bank kartı sayı: %d", len(cards))
     cb_changes = []
     if len(cards) >= 5:
