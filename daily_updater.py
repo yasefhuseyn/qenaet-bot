@@ -1416,16 +1416,18 @@ def extract_from_promo_images_vision(client, candidates: list[dict]) -> list[dic
                     if isinstance(idx, int) and 1 <= idx <= len(loaded):
                         item["_img"] = loaded[idx - 1][0]
                     layout = str(item.pop("layout", "") or "").lower()
-                    if (layout == "single" and per_img.get(idx) == 1 and isinstance(idx, int)
+                    if not (layout == "single" and per_img.get(idx) == 1 and isinstance(idx, int)
                             and 1 <= idx <= len(loaded)):
-                        item["imageUrl"] = loaded[idx - 1][0]   # paylaşımın öz şəkli = məhsulun şəkli
-                        item["imgSrc"] = "source"
-                        STATS["single_photo"] = STATS.get("single_photo", 0) + 1
+                        STATS["catalog_skipped"] = STATS.get("catalog_skipped", 0) + 1
+                        continue   # kataloq/kollaj şəkilləri istifadə olunmur
+                    item["imageUrl"] = loaded[idx - 1][0]   # paylaşımın öz şəkli = məhsulun şəkli
+                    item["imgSrc"] = "source"
+                    STATS["single_photo"] = STATS.get("single_photo", 0) + 1
                     extracted.append(item)
             except Exception as exc:
                 log.warning("  [Vision xətası] %s: %s", market, str(exc)[:160])
     extracted = confirm_vision_items(client, extracted)
-    log.info("  [Vision AI] %d şəkildən %d məhsul oxundu (%d-i tək məhsul fotosu)", STATS["vision_images"], len(extracted), STATS.get("single_photo", 0))
+    log.info("  [Vision AI] %d şəkildən %d məhsul oxundu (%d kataloq/kollaj məhsulu atıldı)", STATS["vision_images"], len(extracted), STATS.get("catalog_skipped", 0))
     return extracted
 
 
