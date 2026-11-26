@@ -1380,6 +1380,45 @@ def confirm_vision_items(client, items: list[dict]) -> list[dict]:
     return kept
 
 
+PDF_MAX_FILES = env_int("PDF_MAX_FILES", 3)
+PDF_MAX_PAGES = env_int("PDF_MAX_PAGES", 10)
+
+
+def collect_pdf_catalogs(blocks: list[dict]) -> None:
+    """Mətnlərdə (Telegram/Facebook/Instagram/sayt) tapılan PDF kataloq/jurnalları səhifə-səhifə şəklə çevirib CATALOG_IMAGES-ə əlavə edir."""
+    try:
+        import fitz  # PyMuPDF
+    except Exception:
+        log.warning("  [PDF] PyMuPDF yoxdur — PDF kataloqlar ötürüldü")
+        return
+    found: dict[str, str] = {}
+    for b in blocks:
+        market = b.get("market") or ""
+        for m in re.finditer(r"https?://[^\s\"'<>)\]]+?\.pdf", json.dumps(b, ensure_ascii=False)):
+            found.setdefault(m.group(0).replace("\\/", "/"), market)
+    n = 0
+    for url, market in found.items():
+        if n >= PDF_MAX_FILES:
+            break
+        try:
+            r = SESSION.get(url, timeout=30)
+            if r.status_code != 200 or len(r.content) < 20000 or len(r.content) > 40_000_000:
+                continue
+            doc = fitz.open(stream=r.content, filetype="pdf")
+            pages = 0
+            for page in doc:
+                if pages >= PDF_MAX_PAGES:
+                    break
+                pix = page.get_pixmap(dpi=150)
+                CATALOG_IMAGES.append({"market": normalize_market(market) or market, "source": "PDF kataloq",
+                                       "url": f"{url}#p{page.number + 1}", "bytes": pix.tobytes("jpeg")})
+                pages += 1
+            n += 1
+            log.info("  [PDF] %s: %d səhifə", url, pages)
+        except Exception as exc:
+            log.warning("  [PDF xətası] %s: %s", url[:80], str(exc)[:100])
+
+
 def download_image_bytes(url: str):
     try:
         r = SESSION.get(url, timeout=15)
@@ -1398,7 +1437,7 @@ def split_catalog_images(client, today: str) -> list[dict]:
     for cat in CATALOG_IMAGES[:CATALOG_MAX_IMAGES]:
         if crops_total >= CATALOG_MAX_CROPS:
             break
-        raw = download_image_bytes(cat["url"])
+        raw = cat.get("bytes") or download_image_bytes(cat["url"])
         if not raw:
             continue
         try:
@@ -2061,6 +2100,7 @@ def main():
 
     log.info("5. Vision AI və Gemini analizi aparılır...")
     vision_items = extract_from_promo_images_vision(client, web_vision + ig_vision + fb_vision + tg_vision)
+    collect_pdf_catalogs(web_blocks + ig_blocks + fb_blocks + tg_blocks)
     try:
         catalog_items = split_catalog_images(client, today)
     except Exception as exc:
