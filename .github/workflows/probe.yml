@@ -13,4 +13,4 @@ jobs:
       - name: Probe
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-        run: python tools/probe.py 2>&1 | grep -v "AFC\|FutureWarning\|warnings.warn"
+        run: python tools/probe2.py 2>&1 | grep -v "AFC\|FutureWarning\|warnings.warn"
