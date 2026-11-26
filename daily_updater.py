@@ -599,6 +599,7 @@ def search_verified_brand_image(client, name: str, kind: str) -> str:
         rel = 1 if (base in url.lower() or base in (it.get("title") or "").lower()) else 0
         cands.append((rel, w * h, url))
     cands.sort(reverse=True)
+    log.info("  [Brend axtarış] %s/%s: %d nəticə, %d namizəd", name, kind, len(results), len(cands))
     for _, _, url in cands[:4]:
         try:
             r = SESSION.get(url, timeout=10)
@@ -613,9 +614,12 @@ def search_verified_brand_image(client, name: str, kind: str) -> str:
                      'Bank adı/loqosu kartda uyğun olmalıdır; insan, təsvirsiz fon, bannerdə mətn və ya başqa bank olarsa uyğun DEYİL. '
                      'YALNIZ JSON: {"match": true} və ya {"match": false}')
             STATS["brand_verified"] += 1
-            if extract_json_object(gemini_text(client, [q, types.Part.from_bytes(data=r.content, mime_type=mime)])).get("match") is True:
+            ok = extract_json_object(gemini_text(client, [q, types.Part.from_bytes(data=r.content, mime_type=mime)])).get("match") is True
+            log.info("  [Brend yoxlama] %s → %s %s", name, "OK" if ok else "uyğun deyil", url[:90])
+            if ok:
                 return url
-        except Exception:
+        except Exception as exc:
+            log.info("  [Brend yoxlama] %s xəta: %s", name, str(exc)[:100])
             continue
     return ""
 
