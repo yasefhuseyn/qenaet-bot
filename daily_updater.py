@@ -571,6 +571,91 @@ def logo_candidates(domain: str) -> list[str]:
     return out
 
 
+TG_AVATAR_SLUGS = {"Bravo": "bravosupermarketaze", "Araz": "arazsupermarket", "OBA": "obamarketlersebekesi", "AL Market": "almarketler",
+                   "Rahat": "rahatsupermarket", "Bazarstore": "bazarstore_az"}
+BANK_SITES = {"Birbank": "birbank.az", "Kapital Bank": "kapitalbank.az", "ABB": "abb-bank.az", "Leobank": "leobank.az",
+              "Yelo Bank": "yelo.az", "Rabitəbank": "rabitabank.com", "Unibank": "unibank.az", "PAŞA Bank": "pashabank.az",
+              "Xalq Bank": "xalqbank.az"}
+
+
+def image_alive(url: str) -> bool:
+    try:
+        r = SESSION.get(url, timeout=10, stream=True)
+        ok = r.status_code == 200 and "image" in (r.headers.get("Content-Type") or "image")
+        r.close()
+        return ok
+    except Exception:
+        return False
+
+
+def gemini_confirms_brand(client, url: str, name: str, kind: str) -> bool:
+    try:
+        r = SESSION.get(url, timeout=10)
+        mime = (r.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if r.status_code != 200 or len(r.content) > 3_000_000 or mime not in ("image/jpeg", "image/png", "image/webp"):
+            return False
+        if kind == "logo":
+            q = (f'Bu şəkil "{name}" şirkətinin (Azərbaycan) loqosudur? Tək loqo olmalı, məhsul/ekran görüntüsü/xəbər şəkli olmamalıdır. '
+                 'YALNIZ JSON: {"match": true} və ya {"match": false}')
+        else:
+            q = (f'Bu şəkil "{name}" bankının plastik ödəniş kartının təmiz görüntüsüdürmü? Bank adı/loqosu uyğun olmalı; '
+                 'insan, bannerdə mətn, xəbər şəkli və ya başqa bank olarsa uyğun DEYİL. YALNIZ JSON: {"match": true} və ya {"match": false}')
+        STATS["brand_verified"] += 1
+        ok = extract_json_object(gemini_text(client, [q, types.Part.from_bytes(data=r.content, mime_type=mime)])).get("match") is True
+        log.info("  [Brend yoxlama] %s/%s → %s %s", name, kind, "OK" if ok else "uyğun deyil", url[:80])
+        return ok
+    except Exception:
+        return False
+
+
+def social_logo_candidates(name: str) -> list[str]:
+    """Telegram kanalının profil şəkli (adətən rəsmi loqo) — t.me səhifəsinin og:image-i."""
+    slug = TG_AVATAR_SLUGS.get(name) or TELEGRAM_CHANNELS.get(name)
+    if not slug:
+        return []
+    html = fetch_html(f"https://t.me/{slug}", timeout=12)
+    if not html:
+        return []
+    soup = BeautifulSoup(html, "html.parser")
+    og = soup.find("meta", property="og:image")
+    return [og["content"]] if og and og.get("content", "").startswith("https://") else []
+
+
+def bank_site_card_candidates(bank: str) -> list[str]:
+    """Bankın öz saytındakı kart şəkilləri: 'card/kart' sözü olan, enli nisbətli şəkillər."""
+    domain = BANK_SITES.get(bank)
+    if not domain:
+        return []
+    pages = [f"https://{domain}/"] + [u for b, u, _ in CASHBACK_SOURCES if b == bank]
+    out = []
+    for page in pages[:2]:
+        html = fetch_html(page, timeout=12)
+        if not html:
+            continue
+        soup = BeautifulSoup(html, "html.parser")
+        base = (soup.find("base") or {}).get("href") or page
+        for im in soup.find_all("img"):
+            src = im.get("data-src") or im.get("src") or ""
+            hay = (src + " " + (im.get("alt") or "")).lower()
+            if src and not src.startswith("data:") and re.search(r"card|kart|visa|mastercard", hay) and not re.search(r"logo|icon|\.svg", hay):
+                u = urljoin(base, src)
+                if u.startswith("https://") and u not in out:
+                    out.append(u)
+        og = soup.find("meta", property="og:image")
+        if og and og.get("content", "").startswith("https://") and og["content"] not in out:
+            out.append(og["content"])
+    return out[:6]
+
+
+def find_brand_image(client, name: str, kind: str) -> str:
+    """Bütün mənbələrdə axtar: rəsmi sayt → sosial şəbəkə/Telegram → bütün internet (Bing); hamısı Gemini ilə təsdiqlənir."""
+    cands = bank_site_card_candidates(name) if kind == "card" else social_logo_candidates(name)
+    for u in cands:
+        if gemini_confirms_brand(client, u, name, kind):
+            return u
+    return search_verified_brand_image(client, name, kind)
+
+
 def search_verified_brand_image(client, name: str, kind: str) -> str:
     """İnternetdə (Bing) loqo / bank kartı şəkli axtarır; yalnız Gemini təsdiqlədikdə qəbul edir."""
     if DDGS is None or client is None or types is None:
@@ -655,7 +740,7 @@ def collect_brand_logos(existing_logos: dict, client=None) -> dict:
 
     def find_with_search(item):
         n, u = find(item)
-        return (n, u) if u else (n, search_verified_brand_image(client, item[0], "logo"))
+        return (n, u) if u else (n, find_brand_image(client, item[0], "logo"))
     find_fn = find_with_search if client is not None else find
     with ThreadPoolExecutor(max_workers=6) as pool:
         for name, url in pool.map(find_fn, todo):
@@ -1611,10 +1696,12 @@ def main():
     assets = read_doc(db, "brand_assets")
     existing_logos = dict(assets.get("logos", {})) if assets.get("version") == LOGO_VERSION else {}
 
-    card_images = {k: v for k, v in dict(assets.get("cards", {})).items() if isinstance(v, str) and v.startswith("https://")}
+    # əvvəlki tapıntılar hələ də açılırmı? Ölü olanlar silinib yenidən axtarılır
+    card_images = {k: v for k, v in dict(assets.get("cards", {})).items() if isinstance(v, str) and v.startswith("https://") and image_alive(v)}
+    existing_logos = {k: v for k, v in existing_logos.items() if isinstance(v, str) and v.startswith("https://") and image_alive(v)}
     for bank in BANK_GRADIENTS:
         if bank not in card_images:
-            u = search_verified_brand_image(client, bank, "card")
+            u = find_brand_image(client, bank, "card")
             if u:
                 card_images[bank] = u
             else:
