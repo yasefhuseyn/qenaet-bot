@@ -2548,7 +2548,12 @@ def main():
         raise RuntimeError("google-genai paketi quraşdırılmayıb.")
     apify_token = os.environ.get("APIFY_TOKEN", "").strip() if os.environ.get("USE_APIFY", "1").strip() != "0" else ""
 
-    client = genai.Client(api_key=api_key)
+    import faulthandler
+    faulthandler.dump_traceback_later(1500, repeat=True)  # donma olarsa, hara ilişdiyini jurnala yazır
+    try:
+        client = genai.Client(api_key=api_key, http_options=types.HttpOptions(timeout=90000))
+    except Exception:
+        client = genai.Client(api_key=api_key)
     pick_models(client)
     db = None if dry else init_firestore()
     now = datetime.now(BAKU_TZ)
