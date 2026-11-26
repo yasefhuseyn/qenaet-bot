@@ -95,7 +95,7 @@ MIN_PRICE, MAX_PRICE = 0.05, 300.0
 GEMINI_BATCH_CHARS = 22000
 GEMINI_MAX_BATCHES = 4
 GEMINI_MIN_INTERVAL = 4.0  # saniyə (pulsuz limitə uyğun)
-LOGO_VERSION = 2           # dəyişəndə bütün loqolar yenidən yoxlanılır
+LOGO_VERSION = 3           # dəyişəndə bütün loqolar yenidən yoxlanılır
 IMAGE_CACHE_VERSION = 2    # dəyişəndə köhnə (yanlış ola bilən) şəkil keşi silinir
 VERIFY_MAX = env_int("VISION_VERIFY_MAX", 60)   # axtarışla tapılan şəkilləri AI ilə yoxlama limiti
 NEG_CACHE_DAYS = 14        # uyğun şəkil tapılmayan məhsul bu müddət təkrar axtarılmır
@@ -118,6 +118,7 @@ MARKET_WEBSITES = [
     ("Neptun", "https://neptun.az/", "neptun.az"),
     ("Grandmart", "https://www.grandmartsupermarket.com/", "grandmartsupermarket.com"),
     ("Bolmart", "https://www.bolmart.az/", "bolmart.az"),
+    ("Tamstore", "https://tamstore.az/", "tamstore.az"),
     ("Spar", "https://spar-international.com/country/azerbaijan-2/", "spar-international.com"),
 ]
 
@@ -172,7 +173,7 @@ BANK_GRADIENTS = {
 }
 DEFAULT_GRADIENT = "from-slate-700 via-slate-800 to-slate-950"
 
-CANONICAL_MARKETS = ["Bravo", "Araz", "Bazarstore", "Rahat", "OBA", "AL Market", "Neptun", "Grandmart", "Spar", "Bolmart"]
+CANONICAL_MARKETS = ["Bravo", "Araz", "Bazarstore", "Rahat", "OBA", "AL Market", "Neptun", "Grandmart", "Spar", "Bolmart", "Tamstore"]
 MARKET_ALIASES = {
     "bravo": "Bravo", "araz": "Araz", "bazar": "Bazarstore", "rahat": "Rahat", "oba": "OBA",
     "almarket": "AL Market", "al market": "AL Market", "al-market": "AL Market", "neptun": "Neptun",
@@ -617,6 +618,29 @@ def gemini_confirms_brand(client, url: str, name: str, kind: str) -> bool:
         return False
 
 
+def facebook_logo_candidates(name: str) -> list[str]:
+    """Rəsmi Facebook səhifəsinin profil şəkli (adətən rəsmi loqo)."""
+    fb = (DEFAULT_SOCIAL_URLS.get(name) or {}).get("fb") or FB_EXTRA.get(name, "")
+    m = re.search(r"facebook\.com/([\w.\-]+)", fb)
+    if not m:
+        return []
+    slug = m.group(1)
+    out = []
+    for u in (f"https://graph.facebook.com/{slug}/picture?width=400&height=400&redirect=true",
+              f"https://graph.facebook.com/{slug}/picture?type=large"):
+        try:
+            r = SESSION.get(u, timeout=10, allow_redirects=True)
+            if r.status_code == 200 and r.headers.get("Content-Type", "").startswith("image") and r.url not in out:
+                out.append(r.url)
+                break
+        except Exception:
+            continue
+    return out
+
+
+FB_EXTRA = {"Tamstore": ""}
+
+
 def social_logo_candidates(name: str) -> list[str]:
     """Telegram kanalının profil şəkli (adətən rəsmi loqo) — t.me səhifəsinin og:image-i."""
     slug = TG_AVATAR_SLUGS.get(name) or TELEGRAM_CHANNELS.get(name)
@@ -658,7 +682,7 @@ def bank_site_card_candidates(bank: str) -> list[str]:
 
 def find_brand_image(client, name: str, kind: str) -> str:
     """Bütün mənbələrdə axtar: rəsmi sayt → sosial şəbəkə/Telegram → bütün internet (Bing); hamısı Gemini ilə təsdiqlənir."""
-    cands = bank_site_card_candidates(name) if kind == "card" else social_logo_candidates(name)
+    cands = bank_site_card_candidates(name) if kind == "card" else (facebook_logo_candidates(name) + social_logo_candidates(name))
     for u in cands:
         if gemini_confirms_brand(client, u, name, kind):
             return u
@@ -748,7 +772,13 @@ def collect_brand_logos(existing_logos: dict, client=None) -> dict:
                 return name, cand
         return name, ""
 
+    market_names = {m for m, _, _ in MARKET_WEBSITES}
+
     def find_with_search(item):
+        if item[0] in market_names:   # marketlər üçün əvvəl rəsmi Facebook profil şəkli
+            for u in facebook_logo_candidates(item[0]):
+                if gemini_confirms_brand(client, u, item[0], "logo"):
+                    return item[0], u
         n, u = find(item)
         return (n, u) if u else (n, find_brand_image(client, item[0], "logo"))
     find_fn = find_with_search if client is not None else find
