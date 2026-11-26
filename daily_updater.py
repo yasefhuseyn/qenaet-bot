@@ -89,6 +89,11 @@ VISION_PER_MARKET = 10     # hər saytdan maksimum promo şəkli
 BAZAR_MAX = env_int("BAZAR_MAX_PRODUCTS", 240)
 EXTRA_PAGES = env_int("EXTRA_PAGES_PER_MARKET", 3)
 IMAGE_SEARCH_MAX = env_int("IMAGE_SEARCH_MAX", 60)
+CATALOG_MAX_IMAGES = env_int("CATALOG_MAX_IMAGES", 20)     # bir işləmədə kəsilən kataloq şəkli sayı
+CATALOG_MAX_CROPS = env_int("CATALOG_MAX_CROPS", 80)       # bir işləmədə kəsilən məhsul şəkli sayı
+CROP_DIR = "product_images"
+CROP_RAW_BASE = "https://raw.githubusercontent.com/yasefhuseyn/qenaet-bot/main/" + CROP_DIR + "/"
+CATALOG_IMAGES: list[dict] = []   # vision zamanı "kataloq" kimi tanınan şəkillər
 MAX_PRODUCTS = 300
 MAX_AGE_DAYS = 10          # bundan köhnə sosial şəbəkə paylaşımları atılır
 MIN_PRICE, MAX_PRICE = 0.05, 300.0
@@ -1375,6 +1380,99 @@ def confirm_vision_items(client, items: list[dict]) -> list[dict]:
     return kept
 
 
+def download_image_bytes(url: str):
+    try:
+        r = SESSION.get(url, timeout=15)
+        if r.status_code != 200 or len(r.content) < 3000 or len(r.content) > 12_000_000:
+            return None
+        return r.content
+    except Exception:
+        return None
+
+
+def split_catalog_images(client, today: str) -> list[dict]:
+    """Kataloq şəklini məhsul-məhsul kəsir: Gemini çərçivə + ad + qiymət verir, kəsilmiş şəkil ikinci oxumayla təsdiqlənir,
+    təsdiqlənənlər product_images/ qovluğuna yazılır (workflow onları repoya yükləyir, raw linklə göstərilir)."""
+    os.makedirs(CROP_DIR, exist_ok=True)
+    out, crops_total = [], 0
+    for cat in CATALOG_IMAGES[:CATALOG_MAX_IMAGES]:
+        if crops_total >= CATALOG_MAX_CROPS:
+            break
+        raw = download_image_bytes(cat["url"])
+        if not raw:
+            continue
+        try:
+            img = Image.open(io.BytesIO(raw)).convert("RGB")
+        except Exception:
+            continue
+        W, H = img.size
+        if W < 700 or H < 700:
+            continue   # çox kiçik kataloq: kəsilən hissələr bulanıq olar
+        mime = "image/jpeg"
+        part = types.Part.from_bytes(data=raw, mime_type=mime) if types is not None else None
+        prompt = (
+            f"Bu {cat['market']} marketinin endirim kataloq şəklidir. Qiyməti (AZN / ₼) aydın görünən HƏR məhsulu ayrıca tap. "
+            "YALNIZ JSON massivi qaytar: "
+            '[{"name": "marka və həcm/çəki ilə tam ad", "oldPrice": 3.5, "price": 2.49, "unit": "1 ədəd", '
+            '"box": [ymin, xmin, ymax, xmax]}]. '
+            "box — yalnız həmin məhsulun öz şəklini (qutu/paket/şüşə) əhatə edən çərçivə, 0-1000 miqyasında "
+            "(şəklin eni və hündürlüyünə nisbətən); qiymət etiketi və başqa məhsullar çərçivəyə düşməsin. "
+            "Qiyməti və ya aydın şəkli olmayan məhsulu yazma. Heç nə uydurma."
+        )
+        try:
+            rows = [x for x in extract_json_array(gemini_text(client, [prompt, part]))
+                    if isinstance(x, dict) and x.get("name") and x.get("price") and isinstance(x.get("box"), list) and len(x["box"]) == 4]
+        except Exception as exc:
+            log.warning("  [Kataloq bölmə xətası] %s: %s", cat["market"], str(exc)[:120])
+            continue
+        crops = []
+        for r in rows[:14]:
+            try:
+                y0, x0, y1, x1 = [max(0.0, min(1000.0, float(v))) for v in r["box"]]
+            except Exception:
+                continue
+            box = (int(x0 * W / 1000), int(y0 * H / 1000), int(x1 * W / 1000), int(y1 * H / 1000))
+            if box[2] - box[0] < 150 or box[3] - box[1] < 150:
+                continue   # çox kiçikdir — keyfiyyətsiz olar
+            crop = img.crop(box)
+            crops.append((r, crop))
+        if not crops:
+            continue
+        # İkinci, müstəqil oxuma: kəsilmiş şəkillər
+        parts = []
+        for _, c in crops:
+            buf = io.BytesIO()
+            c.save(buf, "JPEG", quality=88)
+            parts.append(types.Part.from_bytes(data=buf.getvalue(), mime_type="image/jpeg"))
+        listing = "\n".join(f"{i + 1}. ad: {r['name']} | qiymət: {r['price']} AZN" for i, (r, _) in enumerate(crops))
+        prompt2 = (
+            "Sənə nömrələnmiş kəsilmiş şəkillər verilir (verilmə sırası ilə). Hər biri üçün yoxla: (a) şəkildə YALNIZ BİR məhsul var; "
+            "(b) şəkil aydın və kəskindir (bulanıq deyil, kəsilməyib); (c) aşağıdakı ad və qiymət məhz bu məhsula aiddir "
+            "(qiymət yazısı şəkildə görünürsə uyğun olmalıdır).\n" + listing + "\n"
+            'YALNIZ JSON massivi: [{"n": 1, "ok": true}]. Şübhə varsa ok=false.'
+        )
+        try:
+            verdict = extract_json_array(gemini_text(client, [prompt2] + parts))
+        except Exception as exc:
+            log.warning("  [Kataloq təsdiq xətası] %s", str(exc)[:120])
+            continue
+        ok_idx = {v["n"] - 1 for v in verdict if isinstance(v, dict) and v.get("ok") is True and isinstance(v.get("n"), int)}
+        for i, (r, c) in enumerate(crops):
+            if i not in ok_idx:
+                STATS["crop_rejected"] = STATS.get("crop_rejected", 0) + 1
+                continue
+            c.thumbnail((600, 600))
+            fname = hashlib.sha1((cat["url"] + str(r["box"])).encode()).hexdigest()[:14] + ".jpg"
+            c.save(os.path.join(CROP_DIR, fname), "JPEG", quality=85)
+            item = {"name": r["name"], "price": r["price"], "oldPrice": r.get("oldPrice"), "unit": r.get("unit") or "1 ədəd",
+                    "category": "Ərzaq", "market": cat["market"], "source": cat["source"] + " (kataloq)",
+                    "imageUrl": CROP_RAW_BASE + fname, "imgSrc": "source"}
+            out.append(item)
+            crops_total += 1
+    log.info("  [Kataloq bölmə] %d şəkildən %d məhsul təsdiqləndi, %d rədd edildi", len(CATALOG_IMAGES[:CATALOG_MAX_IMAGES]), len(out), STATS.get("crop_rejected", 0))
+    return out
+
+
 def extract_from_promo_images_vision(client, candidates: list[dict]) -> list[dict]:
     """Aksiya şəkillərini (Instagram, Facebook, Telegram, sayt) Gemini Vision ilə oxuyur; bir sorğuda bir neçə şəkil."""
     seen, by_market = set(), {}
@@ -1419,7 +1517,11 @@ def extract_from_promo_images_vision(client, candidates: list[dict]) -> list[dic
                     if not (layout == "single" and per_img.get(idx) == 1 and isinstance(idx, int)
                             and 1 <= idx <= len(loaded)):
                         STATS["catalog_skipped"] = STATS.get("catalog_skipped", 0) + 1
-                        continue   # kataloq/kollaj şəkilləri istifadə olunmur
+                        if isinstance(idx, int) and 1 <= idx <= len(loaded):
+                            cu = loaded[idx - 1][0]
+                            if all(c["url"] != cu for c in CATALOG_IMAGES):
+                                CATALOG_IMAGES.append({"market": market, "source": source, "url": cu})
+                        continue   # kataloq şəkli bütöv olaraq istifadə olunmur, aşağıda hissələrə bölünür
                     item["imageUrl"] = loaded[idx - 1][0]   # paylaşımın öz şəkli = məhsulun şəkli
                     item["imgSrc"] = "source"
                     STATS["single_photo"] = STATS.get("single_photo", 0) + 1
@@ -1654,7 +1756,10 @@ def build_products(raw_items: list[dict], prev_items: list[dict], image_cache: d
     entry_list = list(entries.values())
 
     def check(e):
-        return e, bool(e["imageUrl"]) and verify_image_url(e["imageUrl"], 200)
+        u = e["imageUrl"]
+        if u.startswith(CROP_RAW_BASE):   # bu işləmədə yaradılıb, workflow sonda repoya yükləyəcək
+            return e, os.path.exists(os.path.join(CROP_DIR, u[len(CROP_RAW_BASE):]))
+        return e, bool(u) and verify_image_url(u, 200)
 
     with ThreadPoolExecutor(max_workers=8) as pool:
         for e, ok in pool.map(check, [e for e in entry_list if e["imageUrl"]]):
@@ -1956,6 +2061,12 @@ def main():
 
     log.info("5. Vision AI və Gemini analizi aparılır...")
     vision_items = extract_from_promo_images_vision(client, web_vision + ig_vision + fb_vision + tg_vision)
+    try:
+        catalog_items = split_catalog_images(client, today)
+    except Exception as exc:
+        log.warning("  [Kataloq bölmə] ötürüldü: %s", str(exc)[:160])
+        catalog_items = []
+    vision_items += catalog_items
     text_blocks = web_blocks + ig_blocks[:40] + fb_blocks[:40] + tg_blocks
     gemini_items = gemini_extract_products(client, text_blocks) if text_blocks else []
     # Yalnız saytda həqiqətən olan və adı məhsula uyğun gələn şəkillər qəbul edilir (Gemini şəkil uydura bilər)
@@ -1976,6 +2087,15 @@ def main():
     multi = sum(1 for p in products if len(p["comparisons"]) > 1)
     log.info("Yekun məhsul: %d (şəkilli: %d, çox marketdə müqayisəli: %d, qiyməti düşən: %d)", len(products), with_img, multi, len(drops))
 
+    # artıq istifadə olunmayan kəsilmiş şəkilləri sil (repo kiçik qalsın)
+    used = {p_["imageUrl"][len(CROP_RAW_BASE):] for p_ in products if str(p_.get("imageUrl", "")).startswith(CROP_RAW_BASE)}
+    if products and os.path.isdir(CROP_DIR):
+        for f_ in os.listdir(CROP_DIR):
+            if f_.endswith(".jpg") and f_ not in used:
+                try:
+                    os.remove(os.path.join(CROP_DIR, f_))
+                except OSError:
+                    pass
     if products:
         write_doc(db, "daily_discounts", {"updatedLabel": f"Yeniləndi: {now_label}", "date": today, "count": len(products), "items": products}, dry)
         write_doc(db, "image_cache", {"map": image_cache}, dry)

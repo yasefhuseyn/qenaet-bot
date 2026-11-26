@@ -14,6 +14,9 @@ on:
         type: boolean
         default: true
 
+permissions:
+  contents: write
+
 concurrency:
   group: qenaet-daily
   cancel-in-progress: false
@@ -44,3 +47,14 @@ jobs:
         with:
           name: dry-run-output
           path: out/
+      - name: Kəsilmiş məhsul şəkillərini repoya yüklə
+        if: ${{ !inputs.dry_run }}
+        run: |
+          git config user.name "qenaet-bot"
+          git config user.email "qenaet-bot@users.noreply.github.com"
+          git add -A product_images
+          if ! git diff --cached --quiet; then
+            git commit -m "Məhsul şəkilləri yeniləndi"
+            git pull --rebase origin main || true
+            git push origin HEAD:main
+          fi
