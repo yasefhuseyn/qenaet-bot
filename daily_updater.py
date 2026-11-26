@@ -80,10 +80,10 @@ def env_int(name: str, default: int) -> int:
         return default
 
 
-IG_POSTS = env_int("IG_POSTS_PER_PAGE", 3)
+IG_POSTS = env_int("IG_POSTS_PER_PAGE", 6)
 FB_POSTS = env_int("FB_POSTS_PER_PAGE", 8)
-TG_POSTS = env_int("TG_POSTS_PER_CHANNEL", 12)
-VISION_MAX = env_int("VISION_MAX_IMAGES", 80)
+TG_POSTS = env_int("TG_POSTS_PER_CHANNEL", 20)
+VISION_MAX = env_int("VISION_MAX_IMAGES", 100)
 VISION_PER_CALL = 4        # bir Gemini sorğusunda neçə şəkil oxunsun
 VISION_PER_MARKET = 10     # hər saytdan maksimum promo şəkli
 BAZAR_MAX = env_int("BAZAR_MAX_PRODUCTS", 240)
@@ -125,12 +125,13 @@ MARKET_WEBSITES = [
 DEFAULT_SOCIAL_URLS = {
     "Bravo":      {"ig": "https://www.instagram.com/bravosupermarketaz/", "fb": "https://www.facebook.com/BravoSupermarketAz/"},
     "Araz":       {"ig": "https://www.instagram.com/arazsupermarket/", "fb": "https://www.facebook.com/arazsupermarket/"},
-    "Bazarstore": {"ig": "https://www.instagram.com/bazarstore_az/", "fb": "https://www.facebook.com/Bazarstore/"},
-    "OBA":        {"ig": "https://www.instagram.com/obamarketler/", "fb": "https://www.facebook.com/obamarketler/"},
-    "AL Market":  {"ig": "https://www.instagram.com/almarket.az/", "fb": "https://www.facebook.com/almarket.az/"},
-    "Rahat":      {"ig": "https://www.instagram.com/rahatmarket/", "fb": "https://www.facebook.com/rahatmarket/"},
-    "Bolmart":    {"ig": "https://www.instagram.com/bolmart.az/", "fb": "https://www.facebook.com/bolmart.az/"},
-    "Grandmart":  {"ig": "https://www.instagram.com/grandmart.az/", "fb": "https://www.facebook.com/grandmart.az/"},
+    "Bazarstore": {"ig": "https://www.instagram.com/bazarstore_supermarket/", "fb": "https://www.facebook.com/bazarstore.az/"},
+    "OBA":        {"ig": "https://www.instagram.com/obamarketler/", "fb": "https://www.facebook.com/obamarket.az/"},
+    "AL Market":  {"ig": "https://www.instagram.com/almarketler/", "fb": "https://www.facebook.com/almarketler/"},
+    "Rahat":      {"ig": "https://www.instagram.com/rahatmarket.az/", "fb": "https://www.facebook.com/rahatmarket.az/"},
+    "Bolmart":    {"ig": "https://www.instagram.com/bolmart.supermarket/", "fb": "https://www.facebook.com/bolmart.supermarket/"},
+    "Grandmart":  {"ig": "https://www.instagram.com/grandmart.supermarket/", "fb": "https://www.facebook.com/grandmart.supermarket/"},
+    "Tamstore":   {"ig": "https://www.instagram.com/tamstore.az/", "fb": "https://www.facebook.com/tamstoremarket/"},
 }
 
 # Facebook səhifələri (rəsmi, 2026-11-26 yoxlanılıb) — saytdan tapılandan üstündür
@@ -147,12 +148,11 @@ VERIFIED_FB = {
     "Neptun": "https://www.facebook.com/neptunsupermarketler/",
 }
 
-TELEGRAM_CHANNELS = {
-    "Bravo": "bravosupermarketaz",
+TELEGRAM_CHANNELS = {   # t.me/s/ ilə açılışı yoxlanılıb (2026-11-26)
+    "Bravo": "bravosupermarketaze",
     "Araz": "arazsupermarket",
-    "OBA": "obamarketaz",
-    "AL Market": "almarketaz",
-    "Bazarstore": "bazarstore_az",
+    "OBA": "obamarketlersebekesi",
+    "AL Market": "almarketler",
 }
 
 CASHBACK_SOURCES = [
@@ -1237,7 +1237,7 @@ def scrape_instagram_via_apify(token: str, socials: dict) -> tuple[list[dict], l
         return [], []
     log.info("  [Apify Instagram] %d hesab (hərəsindən son %d paylaşım)...", len(ig_urls), IG_POSTS)
     posts = apify_run("apify~instagram-scraper", token,
-                      {"directUrls": ig_urls[:12], "resultsType": "posts", "resultsLimit": IG_POSTS}, "Instagram")
+                      {"directUrls": ig_urls[:14], "resultsType": "posts", "resultsLimit": IG_POSTS}, "Instagram")
     blocks, vision = [], []
     for post in posts:
         if not isinstance(post, dict) or not is_recent(post.get("timestamp")):
@@ -1249,7 +1249,7 @@ def scrape_instagram_via_apify(token: str, socials: dict) -> tuple[list[dict], l
         img = post.get("displayUrl") or ""
         if caption:
             blocks.append({"market": market, "source": "Instagram", "text": caption[:700], "imageUrl": img})
-        if img and needs_vision(caption):
+        if img:
             vision.append({"market": market, "source": "Instagram", "imageUrl": img})
     return blocks, vision
 
@@ -1275,7 +1275,7 @@ def scrape_facebook_via_apify(token: str, socials: dict) -> tuple[list[dict], li
             img = first.get("thumbnail") or (first.get("photo_image") or {}).get("uri") or first.get("url") or ""
         if text:
             blocks.append({"market": page, "source": "Facebook", "text": text[:700], "imageUrl": img})
-        if img and needs_vision(text):
+        if img:
             vision.append({"market": page, "source": "Facebook", "imageUrl": img})
     return blocks, vision
 
@@ -1302,7 +1302,7 @@ def scrape_one_telegram(market: str, slug: str) -> tuple[list[dict], list[dict]]
         STATS["tg_posts"] += 1
         if len(text) > 15:
             posts.append({"text": text[:500], "imageUrl": img})
-        if img and needs_vision(text):
+        if img:
             vision.append({"market": market, "source": "Telegram kanalı", "imageUrl": img})
     blocks = [{"market": market, "source": "Telegram kanalı", "posts": posts}] if posts else []
     return blocks, vision
@@ -1344,25 +1344,41 @@ def extract_from_promo_images_vision(client, candidates: list[dict]) -> list[dic
     extracted = []
     for (market, source), urls in by_market.items():
         for i in range(0, len(urls), VISION_PER_CALL):
-            parts = [x for x in (download_image_part(u) for u in urls[i:i + VISION_PER_CALL]) if x is not None]
-            if not parts:
+            chunk = urls[i:i + VISION_PER_CALL]
+            loaded = [(u, download_image_part(u)) for u in chunk]
+            loaded = [(u, part) for u, part in loaded if part is not None]
+            if not loaded:
                 continue
             prompt = (
-                f"Bu şəkillər {market} marketinin endirim/aksiya paylaşımlarıdır. "
-                "Şəkillərdə konkret qiyməti (AZN / ₼) görünən bütün məhsulları YALNIZ JSON massivi kimi qaytar: "
-                '[{"name": "...", "category": "Ərzaq", "oldPrice": 3.5, "price": 2.49, "unit": "1 ədəd", "endDate": "2026-12-31"}]. '
-                "name — marka və həcm/çəki ilə tam ad. endDate yalnız şəkildə yazılıbsa (YYYY-MM-DD). "
+                f"Bu {len(loaded)} şəkil {market} marketinin ({source}) paylaşımlarıdır; şəkillər 1-dən {len(loaded)}-ə nömrələnib "
+                "(verilmə sırası ilə). Şəkillərdə konkret qiyməti (AZN / ₼) görünən bütün məhsulları YALNIZ JSON massivi kimi qaytar: "
+                '[{"imageIndex": 1, "layout": "single", "name": "...", "category": "Ərzaq", "oldPrice": 3.5, "price": 2.49, '
+                '"unit": "1 ədəd", "endDate": "2026-12-31"}]. '
+                "layout: şəkildə YALNIZ BİR məhsul (onun öz fotosu, yanında qiymət yazısı ola bilər) varsa \"single\"; "
+                "bir neçə məhsul, kataloq, vərəq, qiymət cədvəli, banner və ya reklam kollajıdırsa \"catalog\". "
+                "name — marka və həcm/çəki ilə tam ad (şəkildə oxuduğun kimi). endDate yalnız şəkildə yazılıbsa (YYYY-MM-DD). "
                 "Qiymət yoxdursa [] qaytar. Heç nə uydurma."
             )
             try:
-                STATS["vision_images"] += len(parts)
-                for item in extract_json_array(gemini_text(client, [prompt] + parts)):
-                    if isinstance(item, dict) and item.get("name") and item.get("price"):
-                        item["market"], item["source"] = market, source
-                        extracted.append(item)
+                STATS["vision_images"] += len(loaded)
+                rows = [x for x in extract_json_array(gemini_text(client, [prompt] + [p for _, p in loaded]))
+                        if isinstance(x, dict) and x.get("name") and x.get("price")]
+                per_img = {}
+                for x in rows:
+                    per_img[x.get("imageIndex")] = per_img.get(x.get("imageIndex"), 0) + 1
+                for item in rows:
+                    item["market"], item["source"] = market, source
+                    idx = item.pop("imageIndex", None)
+                    layout = str(item.pop("layout", "") or "").lower()
+                    if (layout == "single" and per_img.get(idx) == 1 and isinstance(idx, int)
+                            and 1 <= idx <= len(loaded)):
+                        item["imageUrl"] = loaded[idx - 1][0]   # paylaşımın öz şəkli = məhsulun şəkli
+                        item["imgSrc"] = "source"
+                        STATS["single_photo"] = STATS.get("single_photo", 0) + 1
+                    extracted.append(item)
             except Exception as exc:
                 log.warning("  [Vision xətası] %s: %s", market, str(exc)[:160])
-    log.info("  [Vision AI] %d şəkildən %d məhsul oxundu", STATS["vision_images"], len(extracted))
+    log.info("  [Vision AI] %d şəkildən %d məhsul oxundu (%d-i tək məhsul fotosu)", STATS["vision_images"], len(extracted), STATS.get("single_photo", 0))
     return extracted
 
 
@@ -1611,7 +1627,8 @@ def build_products(raw_items: list[dict], prev_items: list[dict], image_cache: d
             e["imgSrc"] = e.get("imgSrc") or "source"
             continue
         prev = prev_index.get(f"{e['key']}|{e['market']}")
-        if prev and prev.get("imageUrl") and prev.get("imgSrc") in ("source", "verified", "matched"):
+        if (prev and prev.get("imageUrl") and prev.get("imgSrc") in ("source", "verified", "matched")
+                and (not re.search(r"fbcdn|cdninstagram|scontent", prev["imageUrl"]) or image_alive(prev["imageUrl"]))):
             e["imageUrl"], e["imgSrc"] = prev["imageUrl"], prev["imgSrc"]   # yalnız yoxlanmış şəkil təkrar istifadə olunur
         elif (image_cache.get(e["key"]) or "").startswith("https://"):
             e["imageUrl"], e["imgSrc"] = image_cache[e["key"]], "verified"
