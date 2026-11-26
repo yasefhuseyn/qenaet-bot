@@ -327,9 +327,15 @@ def pick_models(client):
         log.warning("  [Gemini] model siyahısı alınmadı (%s), standart siyahı işlədilir", type(exc).__name__)
 
 
+_RUN_START = time.time()
+GEMINI_DEADLINE_SEC = env_int("GEMINI_DEADLINE_SEC", 1800)   # bu vaxtdan sonra Gemini çağırılmır (iş yarımçıq qalmasın)
+
+
 def gemini_text(client, contents) -> str:
     """Gemini-yə sorğu: işləməyən modeli atır, yüklənmiş modeli gözlədir, növbəti modelə keçir."""
     global _last_gemini_call
+    if time.time() - _RUN_START > GEMINI_DEADLINE_SEC:
+        raise RuntimeError("Gemini vaxt limiti keçdi")
     config = None
     if types is not None:
         try:
