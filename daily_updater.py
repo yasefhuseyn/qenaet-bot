@@ -81,9 +81,9 @@ def env_int(name: str, default: int) -> int:
 
 
 IG_POSTS = env_int("IG_POSTS_PER_PAGE", 3)
-FB_POSTS = env_int("FB_POSTS_PER_PAGE", 3)
+FB_POSTS = env_int("FB_POSTS_PER_PAGE", 8)
 TG_POSTS = env_int("TG_POSTS_PER_CHANNEL", 12)
-VISION_MAX = env_int("VISION_MAX_IMAGES", 40)
+VISION_MAX = env_int("VISION_MAX_IMAGES", 80)
 VISION_PER_CALL = 4        # bir Gemini sorğusunda neçə şəkil oxunsun
 VISION_PER_MARKET = 10     # hər saytdan maksimum promo şəkli
 BAZAR_MAX = env_int("BAZAR_MAX_PRODUCTS", 240)
@@ -131,6 +131,20 @@ DEFAULT_SOCIAL_URLS = {
     "Rahat":      {"ig": "https://www.instagram.com/rahatmarket/", "fb": "https://www.facebook.com/rahatmarket/"},
     "Bolmart":    {"ig": "https://www.instagram.com/bolmart.az/", "fb": "https://www.facebook.com/bolmart.az/"},
     "Grandmart":  {"ig": "https://www.instagram.com/grandmart.az/", "fb": "https://www.facebook.com/grandmart.az/"},
+}
+
+# Facebook səhifələri (rəsmi, 2026-11-26 yoxlanılıb) — saytdan tapılandan üstündür
+VERIFIED_FB = {
+    "Bravo": "https://www.facebook.com/BravoSupermarketAz/",
+    "Araz": "https://www.facebook.com/arazsupermarket/",
+    "Bazarstore": "https://www.facebook.com/bazarstore.az/",
+    "OBA": "https://www.facebook.com/obamarket.az/",
+    "AL Market": "https://www.facebook.com/almarketler/",
+    "Rahat": "https://www.facebook.com/rahatmarket.az/",
+    "Bolmart": "https://www.facebook.com/bolmart.supermarket/",
+    "Grandmart": "https://www.facebook.com/grandmart.supermarket/",
+    "Tamstore": "https://www.facebook.com/tamstoremarket/",
+    "Neptun": "https://www.facebook.com/neptunsupermarketler/",
 }
 
 TELEGRAM_CHANNELS = {
@@ -649,7 +663,7 @@ def gemini_confirms_brand(client, url: str, name: str, kind: str, extra: str = "
 
 def facebook_logo_candidates(name: str) -> list[str]:
     """Rəsmi Facebook səhifəsinin profil şəkli (adətən rəsmi loqo)."""
-    fb = (DEFAULT_SOCIAL_URLS.get(name) or {}).get("fb") or FB_EXTRA.get(name, "")
+    fb = FB_EXTRA.get(name) or (DEFAULT_SOCIAL_URLS.get(name) or {}).get("fb") or ""
     m = re.search(r"facebook\.com/([\w.\-]+)", fb)
     if not m:
         return []
@@ -667,7 +681,7 @@ def facebook_logo_candidates(name: str) -> list[str]:
     return out
 
 
-FB_EXTRA = {"Tamstore": ""}
+FB_EXTRA = dict(VERIFIED_FB)
 
 
 def social_logo_candidates(name: str) -> list[str]:
@@ -976,6 +990,8 @@ def scrape_market_websites() -> tuple[list[dict], list[dict], dict, dict, list[d
             socials.setdefault(res["market"], {}).update(res["socials"])  # saytdan tapılan rəsmi ünvan üstünlük qazanır
         if res["telegram"]:
             telegram[res["market"]] = res["telegram"]
+    for m_, fb_ in VERIFIED_FB.items():
+        socials.setdefault(m_, {})["fb"] = fb_
     for pair in (os.environ.get("TELEGRAM_EXTRA") or "").split(","):
         if ":" in pair:
             m, slug = pair.split(":", 1)
@@ -1238,7 +1254,7 @@ def scrape_facebook_via_apify(token: str, socials: dict) -> tuple[list[dict], li
         return [], []
     log.info("  [Apify Facebook] %d səhifə (hərəsindən son %d paylaşım)...", len(fb_urls), FB_POSTS)
     posts = apify_run("automly~facebook-page-posts-scraper", token,
-                      {"pages": fb_urls[:12], "maxPosts": FB_POSTS}, "Facebook")
+                      {"pages": fb_urls[:14], "maxPosts": FB_POSTS}, "Facebook")
     blocks, vision = [], []
     for post in posts:
         if not isinstance(post, dict):
