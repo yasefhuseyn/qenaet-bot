@@ -37,7 +37,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
-from urllib.parse import urljoin, urlparse
+from urllib.parse import quote, urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -95,8 +95,9 @@ MIN_PRICE, MAX_PRICE = 0.05, 300.0
 GEMINI_BATCH_CHARS = 22000
 GEMINI_MAX_BATCHES = 4
 GEMINI_MIN_INTERVAL = 4.0  # saniyə (pulsuz limitə uyğun)
-LOGO_VERSION = 3           # dəyişəndə bütün loqolar yenidən yoxlanılır
+LOGO_VERSION = 4           # dəyişəndə bütün loqolar yenidən yoxlanılır
 IMAGE_CACHE_VERSION = 2    # dəyişəndə köhnə (yanlış ola bilən) şəkil keşi silinir
+BAZAR_LOOKUP_MAX = env_int("BAZAR_LOOKUP_MAX", 80)
 VERIFY_MAX = env_int("VISION_VERIFY_MAX", 60)   # axtarışla tapılan şəkilləri AI ilə yoxlama limiti
 NEG_CACHE_DAYS = 14        # uyğun şəkil tapılmayan məhsul bu müddət təkrar axtarılmır
 _verify_used = 0
@@ -589,18 +590,49 @@ def image_alive(url: str) -> bool:
         return False
 
 
-def gemini_confirms_brand(client, url: str, name: str, kind: str) -> bool:
+def _squash(t: str) -> str:
+    t = (t or "").lower()
+    for a_, b_ in (("ə", "e"), ("ş", "s"), ("ı", "i"), ("ç", "c"), ("ö", "o"), ("ü", "u"), ("ğ", "g")):
+        t = t.replace(a_, b_)
+    return re.sub(r"[^a-z0-9]", "", t)
+
+
+def brand_text_matches(name: str, seen: str) -> bool:
+    n, t = _squash(name), _squash(seen)
+    if not t:
+        return False
+    variants = {n, n.replace("pasa", "pasha")}
+    toks = [_squash(x) for x in name.split() if len(_squash(x)) >= 3 and _squash(x) not in ("bank", "market", "supermarket")]
+    variants |= {x for x in toks} | {x.replace("pasa", "pasha") for x in toks}
+    return any(v and v in t for v in variants)
+
+
+def strict_verify(client, content: bytes, mime: str, name: str, kind: str, extra: str = "", trusted: bool = False) -> bool:
+    """Gemini şəkildəki yazını oxuyur; brend/bank adı uyğun gəlməsə qəbul edilmir."""
+    if kind == "logo":
+        q = ('Bu şəkilə bax və YALNIZ JSON qaytar: {"isSingleLogo": true/false, "readText": "loqodakı oxunan yazı", "brand": "loqonun aid olduğu brend"}. '
+             "isSingleLogo yalnız şəkil tək bir şirkət loqosudursa true olsun (məhsul, foto, ekran görüntüsü, banner, yazısız ümumi ikon, başqa mövzu = false).")
+    else:
+        q = ('Bu şəkilə bax və YALNIZ JSON qaytar: {"isPaymentCard": true/false, "bankOnCard": "kartda yazılan bank/loqo adı", "hasPeople": true/false, "isBannerOrNews": true/false}. '
+             "isPaymentCard yalnız şəkildə təmiz plastik bank kartı əsas obyektdirsə true olsun.")
+    data = extract_json_object(gemini_text(client, [q, types.Part.from_bytes(data=content, mime_type=mime)]))
+    STATS["brand_verified"] += 1
+    if kind == "logo":
+        if data.get("isSingleLogo") is not True:
+            return False
+        seen = f"{data.get('readText') or ''} {data.get('brand') or ''}"
+        return brand_text_matches(name, seen) or (trusted and not _squash(data.get("readText") or ""))
+    if data.get("isPaymentCard") is not True or data.get("hasPeople") is True or data.get("isBannerOrNews") is True:
+        return False
+    return brand_text_matches(name, data.get("bankOnCard") or "")
+
+
+def gemini_confirms_brand(client, url: str, name: str, kind: str, extra: str = "", trusted: bool = False) -> bool:
     try:
         r = SESSION.get(url, timeout=10)
         mime = (r.headers.get("Content-Type") or "").split(";")[0].strip().lower()
         if r.status_code != 200 or len(r.content) > 3_000_000 or mime not in ("image/jpeg", "image/png", "image/webp"):
             return False
-        if kind == "logo":
-            q = (f'Bu şəkil "{name}" şirkətinin (Azərbaycan) loqosudur? Tək loqo olmalı, məhsul/ekran görüntüsü/xəbər şəkli olmamalıdır. '
-                 'YALNIZ JSON: {"match": true} və ya {"match": false}')
-        else:
-            q = (f'Bu şəkil "{name}" bankının plastik ödəniş kartının təmiz görüntüsüdürmü? Bank adı/loqosu uyğun olmalı; '
-                 'insan, bannerdə mətn, xəbər şəkli və ya başqa bank olarsa uyğun DEYİL. YALNIZ JSON: {"match": true} və ya {"match": false}')
         try:
             from PIL import Image
             import io
@@ -610,8 +642,7 @@ def gemini_confirms_brand(client, url: str, name: str, kind: str) -> bool:
                 return False
         except Exception:
             pass
-        STATS["brand_verified"] += 1
-        ok = extract_json_object(gemini_text(client, [q, types.Part.from_bytes(data=r.content, mime_type=mime)])).get("match") is True
+        ok = strict_verify(client, r.content, mime, name, kind, extra, trusted)
         log.info("  [Brend yoxlama] %s/%s → %s %s", name, kind, "OK" if ok else "uyğun deyil", url[:80])
         return ok
     except Exception:
@@ -684,7 +715,7 @@ def find_brand_image(client, name: str, kind: str) -> str:
     """Bütün mənbələrdə axtar: rəsmi sayt → sosial şəbəkə/Telegram → bütün internet (Bing); hamısı Gemini ilə təsdiqlənir."""
     cands = bank_site_card_candidates(name) if kind == "card" else (facebook_logo_candidates(name) + social_logo_candidates(name))
     for u in cands:
-        if gemini_confirms_brand(client, u, name, kind):
+        if gemini_confirms_brand(client, u, name, kind, trusted=True):
             return u
     return search_verified_brand_image(client, name, kind)
 
@@ -738,15 +769,7 @@ def search_verified_brand_image(client, name: str, kind: str, extra: str = "") -
             mime = (r.headers.get("Content-Type") or "").split(";")[0].strip().lower()
             if r.status_code != 200 or len(r.content) > 3_000_000 or mime not in ("image/jpeg", "image/png", "image/webp"):
                 continue
-            if kind == "logo":
-                q = (f'Bu şəkil "{name}" şirkətinin (Azərbaycan) rəsmi loqosudur? Tək loqo olmalı, fon/şəkil/məhsul/ekran görüntüsü olmamalıdır. '
-                     'YALNIZ JSON: {"match": true} və ya {"match": false}')
-            else:
-                q = (f'Bu şəkil "{name} {extra}" bank kartının (debet/kredit) təmiz görüntüsüdürmü? '
-                     'Bank adı/loqosu kartda uyğun olmalıdır; insan, təsvirsiz fon, bannerdə mətn və ya başqa bank olarsa uyğun DEYİL. '
-                     'YALNIZ JSON: {"match": true} və ya {"match": false}')
-            STATS["brand_verified"] += 1
-            ok = extract_json_object(gemini_text(client, [q, types.Part.from_bytes(data=r.content, mime_type=mime)])).get("match") is True
+            ok = strict_verify(client, r.content, mime, name, kind, extra)
             log.info("  [Brend yoxlama] %s %s → %s %s", name, extra, "OK" if ok else "uyğun deyil", url[:90])
             if ok:
                 return url
@@ -767,10 +790,10 @@ def collect_brand_logos(existing_logos: dict, client=None) -> dict:
         name, domain = item
         cands = logo_candidates(domain)
         for cand in cands[:8]:
-            if logo_ok(cand):
+            if logo_ok(cand) and (client is None or gemini_confirms_brand(client, cand, name, "logo", trusted=True)):
                 return name, cand
         for cand in cands:  # son çarə: favicon xidmətləri (kiçik ölçü qəbul edilir)
-            if ("favicons" in cand or "duckduckgo" in cand) and logo_ok(cand, min_side=32):
+            if ("favicons" in cand or "duckduckgo" in cand) and logo_ok(cand, min_side=32) and (client is None or gemini_confirms_brand(client, cand, name, "logo", trusted=True)):
                 return name, cand
         return name, ""
 
@@ -779,7 +802,7 @@ def collect_brand_logos(existing_logos: dict, client=None) -> dict:
     def find_with_search(item):
         if item[0] in market_names:   # marketlər üçün əvvəl rəsmi Facebook profil şəkli
             for u in facebook_logo_candidates(item[0]):
-                if gemini_confirms_brand(client, u, item[0], "logo"):
+                if gemini_confirms_brand(client, u, item[0], "logo", trusted=True):
                     return item[0], u
         n, u = find(item)
         return (n, u) if u else (n, find_brand_image(client, item[0], "logo"))
@@ -1422,6 +1445,67 @@ def clean_item(it: dict, today: str) -> dict | None:
     }
 
 
+def size_sig(name: str):
+    """Çəki/həcmi qram/ml-ə çevirir (500 qr, 0.5 kq, 1 L ...)."""
+    m = re.search(r"(\d+(?:[.,]\d+)?)\s?(kq|kg|qr|gr|g|ml|litr|lt|l)\b", (name or "").lower())
+    if not m:
+        return None
+    v = float(m.group(1).replace(",", "."))
+    return round(v * 1000) if m.group(2) in ("kq", "kg", "litr", "lt", "l") else round(v)
+
+
+def core_tokens(name: str) -> set:
+    return {t for t in name_tokens(name) if not t.isdigit() and t not in ("litr", "kiloqram", "qram", "paket", "ədəd", "bahalı")}
+
+
+def same_product(a: dict, b: dict) -> bool:
+    ta, tb = core_tokens(a["name"]), core_tokens(b["name"])
+    if not ta or not tb:
+        return False
+    sa, sb = size_sig(a["name"]) or size_sig(a.get("unit", "")), size_sig(b["name"]) or size_sig(b.get("unit", ""))
+    if sa and sb and sa != sb:
+        return False
+    inter = len(ta & tb)
+    if sa and sb and min(len(ta), len(tb)) >= 2 and inter / float(min(len(ta), len(tb))) >= 0.99:
+        return True   # ölçü eynidir və qısa ad uzun adın içindədir
+    return inter / float(len(ta | tb)) >= 0.7
+
+
+def group_entries(entry_list: list[dict]) -> dict:
+    """Fərqli marketlərdə eyni məhsulu ad+çəki üzrə uyğunlaşdırır (dəqiq eyni yazılış tələb olunmur)."""
+    groups: list[list[dict]] = []
+    for e in entry_list:
+        for g in groups:
+            if all(x["market"] != e["market"] for x in g) and same_product(g[0], e):
+                g.append(e)
+                break
+        else:
+            groups.append([e])
+    out = {}
+    for g in groups:
+        gk = g[0]["key"]
+        for e in g:
+            out[f"{e['key']}|{e['market']}"] = g
+    return out
+
+
+def bazar_regular_lookup(name: str):
+    """Bazarstore axtarışında eyni məhsulun cari (endirimli və ya adi) qiymətini tapır."""
+    q = " ".join(sorted(core_tokens(name), key=len, reverse=True)[:3])
+    if not q:
+        return None
+    try:
+        items = parse_bazarstore_page(fetch_html("https://bazarstore.az/search?q=" + quote(q), timeout=15))
+    except Exception:
+        return None
+    probe = {"name": name, "unit": ""}
+    for it in items[:8]:
+        if same_product(probe, {"name": it["name"], "unit": it.get("unit", "")}) or \
+           (len(core_tokens(name) & core_tokens(it["name"])) >= 2 and (size_sig(name) in (None, size_sig(it["name"])))):
+            return it
+    return None
+
+
 def build_products(raw_items: list[dict], prev_items: list[dict], image_cache: dict, today: str, client=None) -> tuple[list[dict], list[dict]]:
     """Təmizləyir, təkrarları birləşdirir, marketlər arası müqayisə qurur, tarixçə və şəkilləri yeniləyir."""
     # 1. Təmizlə və (məhsul, market) üzrə ən ucuz təklifi saxla
@@ -1460,9 +1544,19 @@ def build_products(raw_items: list[dict], prev_items: list[dict], image_cache: d
         log.info("  Bitmə tarixi çatmamış %d əvvəlki endirim saxlanıldı", carried)
 
     # 4. Marketlər arası qruplaşdırma
-    groups: dict[str, list[dict]] = {}
-    for e in entries.values():
-        groups.setdefault(e["key"], []).append(e)
+    groups = group_entries(list(entries.values()))
+    # Bazarstore-da olmayan məhsullar üçün onun cari qiymətini axtar (müqayisə üçün)
+    extra_comps: dict[str, dict] = {}
+    todo = []
+    for hk0, g in groups.items():
+        if all(x["market"] != "Bazarstore" for x in g) and id(g) not in {id(t[1]) for t in todo}:
+            todo.append((hk0, g))
+    if todo:
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            for (hk0, g), found in zip(todo[:BAZAR_LOOKUP_MAX], pool.map(lambda t: bazar_regular_lookup(t[1][0]["name"]), todo[:BAZAR_LOOKUP_MAX])):
+                if found:
+                    extra_comps[hk0] = {"market": "Bazarstore", "price": found["price"], "isPromo": bool(found.get("oldPrice"))}
+        log.info("  Bazarstore qiymət müqayisəsi: %d məhsul üçün tapıldı", len(extra_comps))
 
     # 5. Şəkillər: öz şəkli → əvvəlki şəkil → keş → internet axtarışı
     entry_list = list(entries.values())
@@ -1525,7 +1619,11 @@ def build_products(raw_items: list[dict], prev_items: list[dict], image_cache: d
         if prev and not e.get("carried") and safe_float(prev.get("price")) and e["price"] < safe_float(prev["price"]) - 0.005:
             drops.append({"name": e["name"], "market": e["market"], "oldPrice": safe_float(prev["price"]), "price": e["price"]})
 
-        comps = [{"market": g["market"], "price": g["price"], "isPromo": True} for g in groups[e["key"]]]
+        comps = [{"market": g["market"], "price": g["price"], "isPromo": True} for g in groups[hk]]
+        if hk in extra_comps or any(hk2 in extra_comps for hk2 in [f"{x['key']}|{x['market']}" for x in groups[hk]]):
+            ex = extra_comps.get(hk) or next(extra_comps[k2] for k2 in [f"{x['key']}|{x['market']}" for x in groups[hk]] if k2 in extra_comps)
+            if all(c["market"] != "Bazarstore" for c in comps):
+                comps.append(ex)
         comps.sort(key=lambda c: c["price"])
         match = f"{len(comps)} marketdə müqayisə edildi" if len(comps) > 1 else "Bu marketin təklifidir"
         products.append({
@@ -1739,15 +1837,8 @@ def main():
     existing_logos = dict(assets.get("logos", {})) if assets.get("version") == LOGO_VERSION else {}
 
     # əvvəlki tapıntılar hələ də açılırmı? Ölü olanlar silinib yenidən axtarılır
-    card_images = {k: v for k, v in dict(assets.get("cards", {})).items() if isinstance(v, str) and v.startswith("https://") and image_alive(v)}
+    card_images = {k: v for k, v in dict(assets.get("cards", {})).items() if assets.get("version") == LOGO_VERSION and isinstance(v, str) and v.startswith("https://") and image_alive(v)}
     existing_logos = {k: v for k, v in existing_logos.items() if isinstance(v, str) and v.startswith("https://") and image_alive(v)}
-    for bank in BANK_GRADIENTS:
-        if bank not in card_images:
-            u = find_brand_image(client, bank, "card")
-            if u:
-                card_images[bank] = u
-            else:
-                log.warning("  [Kart şəkli] %s üçün uyğun şəkil tapılmadı", bank)
     log.info("1. Market və bank loqoları yoxlanılır...")
     brand_logos = collect_brand_logos(existing_logos, client)
     write_doc(db, "brand_assets", {"updatedLabel": f"Yeniləndi: {now_label}", "version": LOGO_VERSION, "logos": brand_logos, "cards": card_images}, dry)
@@ -1810,8 +1901,6 @@ def main():
                 log.info("  [Kart şəkli] %s — %s: dəqiq şəkil tapıldı", c["bank"], c["cardName"])
         if card_images.get(ckey):
             c["cardImage"] = card_images[ckey]
-        elif card_images.get(c["bank"]):
-            c["cardImage"] = card_images[c["bank"]]
     if not dry:
         write_doc(db, "brand_assets", {"updatedLabel": f"Yeniləndi: {now_label}", "version": LOGO_VERSION, "logos": brand_logos, "cards": card_images}, dry)
     log.info("Yenilənən bank kartı sayı: %d", len(cards))
