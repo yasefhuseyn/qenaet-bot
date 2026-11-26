@@ -771,6 +771,99 @@ def find_brand_image(client, name: str, kind: str) -> str:
     return search_verified_brand_image(client, name, kind)
 
 
+_FOLD = str.maketrans({"ə": "e", "ı": "i", "ö": "o", "ü": "u", "ş": "s", "ç": "c", "ğ": "g", "İ": "i", "Ə": "e"})
+_CARD_GENERIC = {"kart", "karti", "karta", "card", "cards", "bank", "banki", "cashback", "kesbek", "visa", "mastercard", "master",
+                 "debit", "kredit", "credit", "plastik", "digital", "the", "and", "ile"}
+
+
+def _fold(t: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", str(t or "").translate(_FOLD).lower()).strip()
+
+
+def card_name_tokens(bank: str, card_name: str) -> list[str]:
+    bank_words = set(_fold(bank).split())
+    return [w for w in _fold(card_name).split() if len(w) >= 3 and w not in _CARD_GENERIC and w not in bank_words]
+
+
+def official_card_image(client, bank: str, card_name: str, source_url: str = "") -> str:
+    """Kartın şəklini YALNIZ bankın rəsmi saytından axtarır: kartın adı şəklin alt/yazısı/ətrafındakı mətndə keçməlidir,
+    sonra Gemini şəklin təmiz bank kartı və bankın özünə aid olduğunu təsdiqləyir."""
+    domain = BANK_SITES.get(bank)
+    tokens = card_name_tokens(bank, card_name)
+    if not domain or not tokens or client is None:
+        return ""
+    pages = []
+    if source_url and domain in source_url:
+        pages.append(source_url)
+    for u in (f"https://{domain}/", f"https://www.{domain}/"):
+        if u not in pages:
+            pages.append(u)
+    visited, cands = set(), []   # cands: (score, url)
+    queue = pages[:3]
+    follow_budget = 3
+    while queue and len(visited) < 7:
+        page = queue.pop(0)
+        if page in visited:
+            continue
+        visited.add(page)
+        html = fetch_html(page, timeout=12)
+        if not html:
+            continue
+        soup = BeautifulSoup(html, "html.parser")
+        base = (soup.find("base") or {}).get("href") or page
+        for im in soup.find_all("img"):
+            src = im.get("data-src") or im.get("data-lazy-src") or im.get("src") or ""
+            if not src and im.get("srcset"):
+                src = im["srcset"].split(",")[0].strip().split(" ")[0]
+            if not src or src.startswith("data:"):
+                continue
+            low = src.lower()
+            if re.search(r"logo|icon|favicon|sprite|flag|avatar|banner|\.svg|\.gif|qr|app-?store|google-?play", low):
+                continue
+            ctx = " ".join([src, im.get("alt") or "", im.get("title") or ""])
+            node = im
+            for _ in range(3):   # ən yaxın başlıq/mətn bloku
+                node = node.parent
+                if node is None:
+                    break
+                ctx += " " + node.get_text(" ", strip=True)[:160]
+            folded = _fold(ctx)
+            score = sum(1 for t in tokens if t in folded)
+            if score >= len(tokens):
+                cands.append((score + (1 if re.search(r"card|kart", low) else 0), urljoin(base, src)))
+        if follow_budget > 0:   # kartın öz səhifəsinə keçid
+            for a in soup.find_all("a", href=True):
+                if follow_budget <= 0:
+                    break
+                txt = _fold(a.get_text(" ", strip=True) + " " + a["href"])
+                if all(t in txt for t in tokens):
+                    href = urljoin(base, a["href"])
+                    if domain in href and href not in visited and href not in queue:
+                        queue.append(href)
+                        follow_budget -= 1
+    seen_u, ranked = set(), []
+    for sc, u in sorted(cands, key=lambda x: -x[0]):
+        if u.startswith("https://") and u not in seen_u:
+            seen_u.add(u)
+            ranked.append(u)
+    for url in ranked[:4]:
+        try:
+            r = SESSION.get(url, timeout=12)
+            mime = (r.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+            if r.status_code != 200 or len(r.content) > 3_000_000 or len(r.content) < 4000 or mime not in ("image/jpeg", "image/png", "image/webp"):
+                continue
+            w, h = Image.open(io.BytesIO(r.content)).size
+            if w < 260 or h < 150 or not (1.25 <= w / float(h) <= 2.1):
+                continue
+            ok = strict_verify(client, r.content, mime, bank, "card", card_name)
+            log.info("  [Rəsmi kart şəkli] %s — %s: %s %s", bank, card_name, "OK" if ok else "uyğun deyil", url[:90])
+            if ok:
+                return url
+        except Exception as exc:
+            log.info("  [Rəsmi kart şəkli] %s xəta: %s", bank, str(exc)[:100])
+    return ""
+
+
 def search_verified_brand_image(client, name: str, kind: str, extra: str = "") -> str:
     """İnternetdə (Bing) loqo / bank kartı şəkli axtarır; yalnız Gemini təsdiqlədikdə qəbul edir."""
     if DDGS is None or client is None or types is None:
@@ -2563,17 +2656,29 @@ def main():
     log.info("6. Bank cashback-ləri yenilənir...")
     cards = analyze_cashbacks_with_gemini(client)
     card_t0 = time.time()
+    cards_src = dict(assets.get("cardsSrc") or {}) if assets.get("version") == LOGO_VERSION else {}
+    cards_tried = dict(assets.get("cardsTried") or {}) if assets.get("version") == LOGO_VERSION else {}
     for c in cards[:30]:
         ckey = f"{c['bank']}|{c['cardName']}"
-        if not card_images.get(ckey) and time.time() - card_t0 < 240:
+        in_time = time.time() - card_t0 < 420
+        recently_tried = cards_tried.get(ckey, "") >= (datetime.now(timezone(timedelta(hours=4))) - timedelta(days=7)).strftime("%Y-%m-%d")
+        if cards_src.get(ckey) != "official" and not recently_tried and in_time:
+            u = official_card_image(client, c["bank"], c["cardName"], c.get("sourceUrl", ""))
+            cards_tried[ckey] = today
+            if u:
+                card_images[ckey], cards_src[ckey] = u, "official"
+                log.info("  [Kart şəkli] %s — %s: rəsmi saytdan tapıldı", c["bank"], c["cardName"])
+        if not card_images.get(ckey) and in_time:
             u = search_verified_brand_image(client, c["bank"], "card", extra=c["cardName"])
             if u:
-                card_images[ckey] = u
+                card_images[ckey], cards_src[ckey] = u, "web"
                 log.info("  [Kart şəkli] %s — %s: dəqiq şəkil tapıldı", c["bank"], c["cardName"])
         if card_images.get(ckey):
             c["cardImage"] = card_images[ckey]
+    STATS["card_official"] = sum(1 for v in cards_src.values() if v == "official")
     if not dry:
-        write_doc(db, "brand_assets", {"updatedLabel": f"Yeniləndi: {now_label}", "version": LOGO_VERSION, "logos": brand_logos, "cards": card_images}, dry)
+        write_doc(db, "brand_assets", {"updatedLabel": f"Yeniləndi: {now_label}", "version": LOGO_VERSION, "logos": brand_logos, "cards": card_images,
+                                  "cardsSrc": cards_src, "cardsTried": cards_tried}, dry)
     log.info("Yenilənən bank kartı sayı: %d", len(cards))
     cb_changes = []
     if len(cards) >= 5:
