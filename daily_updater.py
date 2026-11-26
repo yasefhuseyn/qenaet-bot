@@ -715,6 +715,8 @@ def search_verified_brand_image(client, name: str, kind: str, extra: str = "") -
         if url in seen_u:
             continue
         seen_u.add(url)
+        if re.search(r"ytimg|youtube|pinterest|pinimg|behance|imgflip|alamy|shutterstock", url):
+            continue
         if not url.startswith("https://") or BAD_IMG_RE.search(url.replace(".svg", "")) and kind == "card":
             continue
         if w and h and (w < 120 or h < 120):
@@ -1798,9 +1800,10 @@ def main():
 
     log.info("6. Bank cashback-ləri yenilənir...")
     cards = analyze_cashbacks_with_gemini(client)
+    card_t0 = time.time()
     for c in cards[:30]:
         ckey = f"{c['bank']}|{c['cardName']}"
-        if not card_images.get(ckey):
+        if not card_images.get(ckey) and time.time() - card_t0 < 240:
             u = search_verified_brand_image(client, c["bank"], "card", extra=c["cardName"])
             if u:
                 card_images[ckey] = u
