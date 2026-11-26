@@ -153,6 +153,11 @@ TELEGRAM_CHANNELS = {   # t.me/s/ ilə açılışı yoxlanılıb (2026-11-26)
     "Araz": "arazsupermarket",
     "OBA": "obamarketlersebekesi",
     "AL Market": "almarketler",
+    "Bazarstore": "bazarstoretelegramkanali",
+    "Rahat": "rahatmarketaz",
+    "Bolmart": "bolmartsupermarket",
+    "Grandmart": "grandmartsupermarket",
+    "Tamstore": "tamstore_az",
 }
 
 CASHBACK_SOURCES = [
