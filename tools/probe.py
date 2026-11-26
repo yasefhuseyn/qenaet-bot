@@ -52,7 +52,8 @@ for market, url, dom in d.MARKET_WEBSITES:
     for sel in ('[class*="product-card"]', '[class*="product-item"]', '[class*="ProductCard"]', 'article', '[class*="product"]'):
         el = soup.select_one(sel)
         if el and PRICE.search(el.get_text(" ")):
-            print(f"  sample[{sel}]: {re.sub(r'\\s+', ' ', str(el))[:700]}")
+            snippet = re.sub(r"\s+", " ", str(el))[:700]
+            print("  sample[" + sel + "]: " + snippet)
             break
     # script src / api hints
     apis = set()
