@@ -575,18 +575,27 @@ def search_verified_brand_image(client, name: str, kind: str) -> str:
     """İnternetdə (Bing) loqo / bank kartı şəkli axtarır; yalnız Gemini təsdiqlədikdə qəbul edir."""
     if DDGS is None or client is None or types is None:
         return ""
-    query = f"{name} rəsmi loqo logo" if kind == "logo" else f"{name} bank card debit credit card design"
-    try:
-        time.sleep(0.5)
-        results = DDGS().images(query, max_results=12, backend="bing") or []
-    except Exception as exc:
-        log.debug("  [Brend şəkil axtarışı] %s: %s", name, type(exc).__name__)
-        return ""
-    base = name.lower().split()[0]
+    is_market = name in [m for m, _, _ in MARKET_WEBSITES]
+    if kind == "logo":
+        queries = [f"{name} {'supermarket ' if is_market else 'bank '}Azerbaijan logo", f"{name} loqo az"]
+    else:
+        queries = [f"{name} Azərbaycan bank kartı", f"{name} bank card Azerbaijan visa mastercard"]
+    results = []
+    for query in queries:
+        try:
+            time.sleep(0.5)
+            results += DDGS().images(query, max_results=12, backend="bing") or []
+        except Exception as exc:
+            log.debug("  [Brend şəkil axtarışı] %s: %s", name, type(exc).__name__)
+    base = re.sub(r"[^a-z0-9ə]", "", name.lower().split()[0].replace("ş", "s").replace("ı", "i"))
+    seen_u = set()
     cands = []
     for it in results:
         url = it.get("image") or ""
         w, h = int(it.get("width") or 0), int(it.get("height") or 0)
+        if url in seen_u:
+            continue
+        seen_u.add(url)
         if not url.startswith("https://") or BAD_IMG_RE.search(url.replace(".svg", "")) and kind == "card":
             continue
         if w and h and (w < 120 or h < 120):
@@ -596,8 +605,10 @@ def search_verified_brand_image(client, name: str, kind: str) -> str:
             continue
         if kind == "card" and not (1.2 <= ratio <= 2.0):
             continue
-        rel = 1 if (base in url.lower() or base in (it.get("title") or "").lower()) else 0
-        cands.append((rel, w * h, url))
+        hay = (url + " " + (it.get("title") or "")).lower()
+        rel = 1 if any(b_ in hay for b_ in {base, base.replace("pasa", "pasha"), base.replace("pasa", "paşa")}) else 0
+        if rel:
+            cands.append((rel, w * h, url))
     cands.sort(reverse=True)
     log.info("  [Brend axtarış] %s/%s: %d nəticə, %d namizəd", name, kind, len(results), len(cands))
     for _, _, url in cands[:4]:
