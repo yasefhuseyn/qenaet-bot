@@ -1470,7 +1470,7 @@ def scrape_instagram_via_apify(token: str, socials: dict) -> tuple[list[dict], l
         if caption:
             blocks.append({"market": market, "source": "Instagram", "text": caption[:700], "imageUrl": img})
         if img:
-            vision.append({"market": market, "source": "Instagram", "imageUrl": img})
+            vision.append({"market": market, "source": "Instagram", "imageUrl": img, "caption": caption[:700]})
     return blocks, vision
 
 
@@ -1496,7 +1496,7 @@ def scrape_facebook_via_apify(token: str, socials: dict) -> tuple[list[dict], li
         if text:
             blocks.append({"market": page, "source": "Facebook", "text": text[:700], "imageUrl": img})
         if img:
-            vision.append({"market": page, "source": "Facebook", "imageUrl": img})
+            vision.append({"market": page, "source": "Facebook", "imageUrl": img, "caption": text[:700]})
     return blocks, vision
 
 
@@ -1520,10 +1520,11 @@ def scrape_one_telegram(market: str, slug: str) -> tuple[list[dict], list[dict]]
             if m:
                 img = m.group(1)
         STATS["tg_posts"] += 1
+        cap_text = txt_el.get_text("\n", strip=True) if txt_el else ""
         if len(text) > 15:
             posts.append({"text": text[:500], "imageUrl": img})
         if img:
-            vision.append({"market": market, "source": "Telegram kanalı", "imageUrl": img})
+            vision.append({"market": market, "source": "Telegram kanalı", "imageUrl": img, "caption": cap_text[:700]})
     blocks = [{"market": market, "source": "Telegram kanalı", "posts": posts}] if posts else []
     return blocks, vision
 
@@ -1723,17 +1724,130 @@ def split_catalog_images(client, today: str) -> list[dict]:
     return out
 
 
+AZ_MONTHS = {"yanvar": 1, "fevral": 2, "mart": 3, "aprel": 4, "may": 5, "iyun": 6, "iyul": 7, "avqust": 8,
+             "sentyabr": 9, "oktyabr": 10, "noyabr": 11, "dekabr": 12}
+_MONTH_RE = "|".join(AZ_MONTHS)
+_PRICE_RE = re.compile(r"(\d{1,4}(?:[.,]\d{1,2})?)\s*(?:₼|azn|man(?:at)?\b)", re.I)
+_NOISE_WORDS = re.compile(r"\b(endirim\w*|aksiya\w*|yalnız|qiymət\w*|günün|təklif\w*|qənaət\w*|tarixi|hər gün|hergun və|bu gün|"
+                          r"ələ keç|yeni|kampaniya\w*|əvəzinə|köhnə|yeni qiymət)\b", re.I)
+
+
+def parse_end_date(text: str) -> str:
+    """'26-30 noyabr' / '30 noyabrdək' kimi yazıdan bitmə tarixini (YYYY-MM-DD) çıxarır."""
+    low = (text or "").lower()
+    m = re.search(r"(\d{1,2})\s*[-–—]\s*(\d{1,2})\s*(" + _MONTH_RE + r")", low) or \
+        re.search(r"()(\d{1,2})\s*(" + _MONTH_RE + r")", low)
+    if not m:
+        return ""
+    day, month = int(m.group(2)), AZ_MONTHS[m.group(3)]
+    now = datetime.now(timezone(timedelta(hours=4)))
+    try:
+        d = datetime(now.year, month, day, tzinfo=now.tzinfo)
+    except ValueError:
+        return ""
+    if d < now - timedelta(days=60):
+        d = d.replace(year=now.year + 1)
+    return d.strftime("%Y-%m-%d")
+
+
+def parse_caption_item(text: str):
+    """Paylaşımın yazısında BİR məhsulun adı və qiyməti açıq yazılıbsa onu qaytarır; yoxsa None (şəkildən oxunacaq)."""
+    if not text or len(text) < 6:
+        return None
+    prices = []
+    for raw in _PRICE_RE.findall(text):
+        try:
+            v = float(raw.replace(",", "."))
+        except ValueError:
+            continue
+        if 0.05 <= v <= 5000:
+            prices.append(round(v, 2))
+    uniq = sorted(set(prices))
+    if not uniq or len(uniq) > 2:
+        return None
+    price = uniq[0]
+    old = uniq[1] if len(uniq) == 2 and uniq[1] >= price * 1.05 else 0
+    name = ""
+    for line in text.split("\n"):
+        ln = _PRICE_RE.sub(" ", line)
+        ln = re.sub(r"https?://\S+|[#@]\S+|\d{1,2}\s*[-–—]\s*\d{1,2}\s*(" + _MONTH_RE + r")\S*|-\s*\d+\s*%|\d+\s*%\s*(?:endirim\w*|daha\s+qənaətli)", " ", ln, flags=re.I)
+        ln = _NOISE_WORDS.sub(" ", ln)
+        ln = re.sub(r"[^\w%.,/+()\- əƏıİöÖüÜçÇşŞğĞ]", " ", ln)
+        ln = re.sub(r"\s+", " ", ln).strip(" -–—.,:;()")
+        if len(ln) >= 5 and sum(c.isalpha() for c in ln) >= 4:
+            name = ln[:80]
+            break
+    if not name:
+        return None
+    return {"name": name, "price": price, "oldPrice": old, "unit": "1 ədəd", "category": "Ərzaq",
+            "endDate": parse_end_date(text)}
+
+
+def check_caption_items(client, items: list[dict]) -> list[dict]:
+    """Yazıdan oxunan məhsulların şəklini yoxlayır: tək məhsul şəkli olmalıdır (kataloq/kollaj yox).
+    Şəkildə qiymət oxunursa yazıdakı ilə üst-üstə düşməlidir. Gemini işləmirsə yazıdakı tək qiymət kifayət edir."""
+    kept = []
+
+    def check(it):
+        part = download_image_part(it["_img"])
+        if part is None:
+            return None
+        if client is None:
+            return it
+        prompt = (
+            "Bu şəkil bir marketin paylaşımıdır. Şəkildə YALNIZ BİR məhsulun öz fotosu varsa single=true; bir neçə məhsul, "
+            "kataloq, vərəq, qiymət cədvəli və ya reklam kollajıdırsa single=false. Şəkildə görünən endirimli (yeni) qiyməti "
+            'oxu. YALNIZ JSON qaytar: {"single": true, "price": 9.99, "name": "şəkildəki tam ad"}. Qiymət görünmürsə price=null. Uydurma.'
+        )
+        try:
+            raw = gemini_text(client, [prompt, part])
+            m = re.search(r"\{.*\}", raw or "", re.S)
+            res = json.loads(m.group(0)) if m else {}
+        except Exception:
+            return it   # Gemini cavab vermədi (kvota) — yazıdakı tək qiymətə güvənirik
+        if res.get("single") is False:
+            if all(c["url"] != it["_img"] for c in CATALOG_IMAGES):
+                CATALOG_IMAGES.append({"market": it["market"], "source": it["source"], "url": it["_img"]})
+            return None
+        read_price = safe_float(res.get("price"), 0) or 0
+        if read_price and abs(read_price - it["price"]) > 0.011 and abs(read_price - (it.get("oldPrice") or -1)) > 0.011:
+            log.info("  [Yazı≠şəkil] %s: yazıda %.2f, şəkildə %.2f — atıldı", it["name"][:40], it["price"], read_price)
+            return None
+        return it
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        for it in pool.map(check, items):
+            if it:
+                kept.append(it)
+    return kept
+
+
 def extract_from_promo_images_vision(client, candidates: list[dict]) -> list[dict]:
     """Aksiya şəkillərini (Instagram, Facebook, Telegram, sayt) Gemini Vision ilə oxuyur; bir sorğuda bir neçə şəkil."""
     seen, by_market = set(), {}
+    captions: dict[str, str] = {}
+    from_caption = []
     for cand in candidates:
         url = cand.get("imageUrl")
         if not url or url in seen or len(seen) >= VISION_MAX:
             continue
         seen.add(url)
+        cap = (cand.get("caption") or "").strip()
+        parsed = parse_caption_item(cap) if cap else None
+        if parsed:   # ad və qiymət paylaşımın yazısında var — şəkildən oxumağa ehtiyac yoxdur
+            parsed.update({"market": cand["market"], "source": cand.get("source", "Sosial şəbəkə"), "_img": url})
+            from_caption.append(parsed)
+            continue
+        if cap:
+            captions[url] = cap[:300]
         by_market.setdefault((cand["market"], cand.get("source", "Sosial şəbəkə")), []).append(url)
+    cap_ok = check_caption_items(client, from_caption) if from_caption else []
+    for it in cap_ok:
+        it["imageUrl"], it["imgSrc"] = it.pop("_img"), "source"
+    STATS["caption_items"] = len(cap_ok)
+    log.info("  [Yazıdan oxuma] %d paylaşımda ad+qiymət yazıdan götürüldü, %d təsdiqləndi", len(from_caption), len(cap_ok))
 
-    extracted = []
+    extracted = []   # yalnız şəkildən oxunanlar (yazıdan oxunanlar cap_ok-dadır)
     for (market, source), urls in by_market.items():
         for i in range(0, len(urls), VISION_PER_CALL):
             chunk = urls[i:i + VISION_PER_CALL]
@@ -1741,6 +1855,7 @@ def extract_from_promo_images_vision(client, candidates: list[dict]) -> list[dic
             loaded = [(u, part) for u, part in loaded if part is not None]
             if not loaded:
                 continue
+            hints = "".join(f"\nŞəkil {n} paylaşımının yazısı: {captions[u]}" for n, (u, _) in enumerate(loaded, 1) if u in captions)
             prompt = (
                 f"Bu {len(loaded)} şəkil {market} marketinin ({source}) paylaşımlarıdır; şəkillər 1-dən {len(loaded)}-ə nömrələnib "
                 "(verilmə sırası ilə). Şəkillərdə konkret qiyməti (AZN / ₼) görünən bütün məhsulları YALNIZ JSON massivi kimi qaytar: "
@@ -1749,7 +1864,8 @@ def extract_from_promo_images_vision(client, candidates: list[dict]) -> list[dic
                 "layout: şəkildə YALNIZ BİR məhsul (onun öz fotosu, yanında qiymət yazısı ola bilər) varsa \"single\"; "
                 "bir neçə məhsul, kataloq, vərəq, qiymət cədvəli, banner və ya reklam kollajıdırsa \"catalog\". "
                 "name — marka və həcm/çəki ilə tam ad (şəkildə oxuduğun kimi). endDate yalnız şəkildə yazılıbsa (YYYY-MM-DD). "
-                "Qiymət yoxdursa [] qaytar. Heç nə uydurma."
+                "Əvvəlcə paylaşımın yazısındakı ad, qiymət və tarixə bax (aşağıda verilib), yazıda yoxdursa şəkildəki yazıları oxu. "
+                "Qiymət yoxdursa [] qaytar. Heç nə uydurma." + hints
             )
             try:
                 STATS["vision_images"] += len(loaded)
@@ -1778,7 +1894,7 @@ def extract_from_promo_images_vision(client, candidates: list[dict]) -> list[dic
                     extracted.append(item)
             except Exception as exc:
                 log.warning("  [Vision xətası] %s: %s", market, str(exc)[:160])
-    extracted = confirm_vision_items(client, extracted)
+    extracted = cap_ok + confirm_vision_items(client, extracted)
     log.info("  [Vision AI] %d şəkildən %d məhsul oxundu (%d kataloq/kollaj məhsulu atıldı)", STATS["vision_images"], len(extracted), STATS.get("catalog_skipped", 0))
     return extracted
 
