@@ -97,7 +97,7 @@ GEMINI_MAX_BATCHES = 4
 GEMINI_MIN_INTERVAL = 4.0  # saniyə (pulsuz limitə uyğun)
 LOGO_VERSION = 4           # dəyişəndə bütün loqolar yenidən yoxlanılır
 IMAGE_CACHE_VERSION = 2    # dəyişəndə köhnə (yanlış ola bilən) şəkil keşi silinir
-BAZAR_LOOKUP_MAX = env_int("BAZAR_LOOKUP_MAX", 80)
+BAZAR_LOOKUP_MAX = env_int("BAZAR_LOOKUP_MAX", 300)
 VERIFY_MAX = env_int("VISION_VERIFY_MAX", 60)   # axtarışla tapılan şəkilləri AI ilə yoxlama limiti
 NEG_CACHE_DAYS = 14        # uyğun şəkil tapılmayan məhsul bu müddət təkrar axtarılmır
 _verify_used = 0
@@ -1336,6 +1336,45 @@ def download_image_part(url: str):
         return None
 
 
+def confirm_vision_items(client, items: list[dict]) -> list[dict]:
+    """İkinci, müstəqil oxuma: şəkildəki yazı ilə çıxarılan ad və qiymət uyğun gəlmirsə məhsul atılır."""
+    by_img: dict[str, list[dict]] = {}
+    for it in items:
+        by_img.setdefault(it.get("_img") or "", []).append(it)
+    kept, dropped = [], 0
+
+    def confirm(url, group):
+        part = download_image_part(url) if url else None
+        if part is None:
+            return []
+        listing = "\n".join(f"{i + 1}. ad: {g['name']} | qiymət: {g['price']} AZN" for i, g in enumerate(group))
+        prompt = (
+            "Şəkli diqqətlə oxu. Aşağıdakı hər sətir üçün YALNIZ şəkildə yazılı olana əsasən yoxla: bu ad (marka, həcm/çəki) "
+            "və məhz bu qiymət şəkildə, eyni məhsulun yanında görünürmü?\n" + listing + "\n"
+            'YALNIZ JSON massivi qaytar: [{"n": 1, "ok": true, "readPrice": 2.49}]. ok yalnız ad və qiymət şəkildən '
+            "tam təsdiqlənirsə true; qiymət fərqlidirsə ok=false və readPrice-a şəkildə gördüyün qiyməti yaz. Təxmin etmə."
+        )
+        try:
+            res = extract_json_array(gemini_text(client, [prompt, part]))
+        except Exception:
+            return []
+        ok_idx = set()
+        for r in res:
+            if isinstance(r, dict) and r.get("ok") is True and isinstance(r.get("n"), int):
+                ok_idx.add(r["n"] - 1)
+        return [g for i, g in enumerate(group) if i in ok_idx]
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        for (url, group), good in zip(by_img.items(), pool.map(lambda kv: confirm(*kv), by_img.items())):
+            dropped += len(group) - len(good)
+            kept += good
+    for it in kept:
+        it.pop("_img", None)
+    STATS["vision_dropped"] = dropped
+    log.info("  [Vision təsdiqi] %d məhsul təsdiqləndi, %d təsdiqlənmədi və atıldı", len(kept), dropped)
+    return kept
+
+
 def extract_from_promo_images_vision(client, candidates: list[dict]) -> list[dict]:
     """Aksiya şəkillərini (Instagram, Facebook, Telegram, sayt) Gemini Vision ilə oxuyur; bir sorğuda bir neçə şəkil."""
     seen, by_market = set(), {}
@@ -1374,6 +1413,8 @@ def extract_from_promo_images_vision(client, candidates: list[dict]) -> list[dic
                 for item in rows:
                     item["market"], item["source"] = market, source
                     idx = item.pop("imageIndex", None)
+                    if isinstance(idx, int) and 1 <= idx <= len(loaded):
+                        item["_img"] = loaded[idx - 1][0]
                     layout = str(item.pop("layout", "") or "").lower()
                     if (layout == "single" and per_img.get(idx) == 1 and isinstance(idx, int)
                             and 1 <= idx <= len(loaded)):
@@ -1383,6 +1424,7 @@ def extract_from_promo_images_vision(client, candidates: list[dict]) -> list[dic
                     extracted.append(item)
             except Exception as exc:
                 log.warning("  [Vision xətası] %s: %s", market, str(exc)[:160])
+    extracted = confirm_vision_items(client, extracted)
     log.info("  [Vision AI] %d şəkildən %d məhsul oxundu (%d-i tək məhsul fotosu)", STATS["vision_images"], len(extracted), STATS.get("single_photo", 0))
     return extracted
 
@@ -1533,18 +1575,22 @@ def group_entries(entry_list: list[dict]) -> dict:
 
 def bazar_regular_lookup(name: str):
     """Bazarstore axtarışında eyni məhsulun cari (endirimli və ya adi) qiymətini tapır."""
-    q = " ".join(sorted(core_tokens(name), key=len, reverse=True)[:3])
-    if not q:
-        return None
-    try:
-        items = parse_bazarstore_page(fetch_html("https://bazarstore.az/search?q=" + quote(q), timeout=15))
-    except Exception:
-        return None
+    words = sorted(core_tokens(name), key=len, reverse=True)
     probe = {"name": name, "unit": ""}
-    for it in items[:8]:
-        if same_product(probe, {"name": it["name"], "unit": it.get("unit", "")}) or \
-           (len(core_tokens(name) & core_tokens(it["name"])) >= 2 and (size_sig(name) in (None, size_sig(it["name"])))):
-            return it
+    tried = set()
+    for n in (3, 2):
+        q = " ".join(words[:n])
+        if not q or q in tried:
+            continue
+        tried.add(q)
+        try:
+            items = parse_bazarstore_page(fetch_html("https://bazarstore.az/search?q=" + quote(q), timeout=15))
+        except Exception:
+            continue
+        for it in items[:10]:
+            if same_product(probe, {"name": it["name"], "unit": it.get("unit", "")}) or \
+               (len(core_tokens(name) & core_tokens(it["name"])) >= 2 and (size_sig(name) in (None, size_sig(it["name"])))):
+                return it
     return None
 
 
@@ -1594,7 +1640,7 @@ def build_products(raw_items: list[dict], prev_items: list[dict], image_cache: d
         if all(x["market"] != "Bazarstore" for x in g) and id(g) not in {id(t[1]) for t in todo}:
             todo.append((hk0, g))
     if todo:
-        with ThreadPoolExecutor(max_workers=6) as pool:
+        with ThreadPoolExecutor(max_workers=8) as pool:
             for (hk0, g), found in zip(todo[:BAZAR_LOOKUP_MAX], pool.map(lambda t: bazar_regular_lookup(t[1][0]["name"]), todo[:BAZAR_LOOKUP_MAX])):
                 if found:
                     extra_comps[hk0] = {"market": "Bazarstore", "price": found["price"], "isPromo": bool(found.get("oldPrice"))}
