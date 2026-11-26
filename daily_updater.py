@@ -100,6 +100,8 @@ IMAGE_CACHE_VERSION = 2    # dəyişəndə köhnə (yanlış ola bilən) şəkil
 VERIFY_MAX = env_int("VISION_VERIFY_MAX", 60)   # axtarışla tapılan şəkilləri AI ilə yoxlama limiti
 NEG_CACHE_DAYS = 14        # uyğun şəkil tapılmayan məhsul bu müddət təkrar axtarılmır
 _verify_used = 0
+IMAGE_BUDGET_SEC = env_int("IMAGE_BUDGET_SEC", 480)   # şəkil axtarışı üçün ümumi vaxt limiti
+_img_started = 0.0
 
 WATERMARK_DOMAINS = (
     "shutterstock.com", "istockphoto.com", "gettyimages.com", "alamy.com",
@@ -468,14 +470,17 @@ def find_high_quality_product_image(product_name: str, image_cache: dict, client
                 return ""
         except ValueError:
             pass
-    if DDGS is None or client is None or _verify_used >= VERIFY_MAX:
+    global _img_started
+    if not _img_started:
+        _img_started = time.time()
+    if DDGS is None or client is None or _verify_used >= VERIFY_MAX or time.time() - _img_started > IMAGE_BUDGET_SEC:
         return ""
     STATS["image_searches"] += 1
     need = 2 if len(name_tokens(product_name)) >= 2 else 1
     qname = clean_query_name(product_name)
     scored = {}
-    for q in (qname, f"{qname} market"):
-        for backend in ("google", "bing"):
+    for q in (qname,):
+        for backend in ("bing",):
             try:
                 time.sleep(0.5)
                 results = DDGS().images(q, max_results=10, backend=backend) or []
