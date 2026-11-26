@@ -116,7 +116,6 @@ MARKET_WEBSITES = [
     ("Rahat", "https://rahatmarket.az/az/aksiyalar/rahat-market", "rahatmarket.az"),
     ("Bazarstore", "https://bazarstore.az/", "bazarstore.az"),
     ("AL Market", "https://almarket.az/", "almarket.az"),
-    ("Neptun", "https://neptun.az/", "neptun.az"),
     ("Grandmart", "https://www.grandmartsupermarket.com/", "grandmartsupermarket.com"),
     ("Bolmart", "https://www.bolmart.az/", "bolmart.az"),
     ("Tamstore", "https://tamstore.az/", "tamstore.az"),
@@ -131,7 +130,6 @@ DEFAULT_SOCIAL_URLS = {
     "OBA":        {"ig": "https://www.instagram.com/obamarketler/", "fb": "https://www.facebook.com/obamarketler/"},
     "AL Market":  {"ig": "https://www.instagram.com/almarket.az/", "fb": "https://www.facebook.com/almarket.az/"},
     "Rahat":      {"ig": "https://www.instagram.com/rahatmarket/", "fb": "https://www.facebook.com/rahatmarket/"},
-    "Neptun":     {"ig": "https://www.instagram.com/neptunsupermarket/", "fb": "https://www.facebook.com/neptunsupermarket/"},
     "Bolmart":    {"ig": "https://www.instagram.com/bolmart.az/", "fb": "https://www.facebook.com/bolmart.az/"},
     "Grandmart":  {"ig": "https://www.instagram.com/grandmart.az/", "fb": "https://www.facebook.com/grandmart.az/"},
 }
@@ -174,10 +172,11 @@ BANK_GRADIENTS = {
 }
 DEFAULT_GRADIENT = "from-slate-700 via-slate-800 to-slate-950"
 
-CANONICAL_MARKETS = ["Bravo", "Araz", "Bazarstore", "Rahat", "OBA", "AL Market", "Neptun", "Grandmart", "Spar", "Bolmart", "Tamstore"]
+EXCLUDED_MARKETS = {"Neptun"}
+CANONICAL_MARKETS = ["Bravo", "Araz", "Bazarstore", "Rahat", "OBA", "AL Market", "Grandmart", "Spar", "Bolmart", "Tamstore"]
 MARKET_ALIASES = {
     "bravo": "Bravo", "araz": "Araz", "bazar": "Bazarstore", "rahat": "Rahat", "oba": "OBA",
-    "almarket": "AL Market", "al market": "AL Market", "al-market": "AL Market", "neptun": "Neptun",
+    "almarket": "AL Market", "al market": "AL Market", "al-market": "AL Market",
     "grandmart": "Grandmart", "grand mart": "Grandmart", "spar": "Spar", "bolmart": "Bolmart", "bol mart": "Bolmart",
 }
 ALLOWED_CATEGORIES = ("Süd məhsulları", "Ərzaq", "İçkilər", "Təmizlik", "Şirniyyat")
@@ -1398,7 +1397,7 @@ def gemini_extract_products(client, blocks: list[dict]) -> list[dict]:
             "3. endDate yalnız mətndə bitmə tarixi yazılıbsa (YYYY-MM-DD), yoxdursa boş burax.\n"
             "4. imageUrl yalnız veb sayt blokundakı `images` siyahısından tək məhsulun şəkli ola bilər; "
             "toplu kataloq/post şəkillərini yazma.\n"
-            "5. market: Bravo, Araz, Bazarstore, Rahat, OBA, AL Market, Neptun, Grandmart, Spar, Bolmart.\n"
+            "5. market: Bravo, Araz, Bazarstore, Rahat, OBA, AL Market, Grandmart, Spar, Bolmart.\n"
             "6. YALNIZ JSON massivi qaytar (maksimum 60 məhsul). Sahələr: name, category "
             '("Süd məhsulları"|"Ərzaq"|"İçkilər"|"Təmizlik"|"Şirniyyat"), market, '
             'source ("Instagram"|"Facebook"|"Veb sayt"|"Telegram kanalı"), oldPrice, price, unit, imageUrl, endDate.\n\n'
@@ -1513,7 +1512,7 @@ def build_products(raw_items: list[dict], prev_items: list[dict], image_cache: d
     entries: dict[str, dict] = {}
     for it in raw_items:
         e = clean_item(it, today)
-        if not e:
+        if not e or e["market"] in EXCLUDED_MARKETS:
             continue
         hk = f"{e['key']}|{e['market']}"
         if hk not in entries or e["price"] < entries[hk]["price"]:
@@ -1533,7 +1532,7 @@ def build_products(raw_items: list[dict], prev_items: list[dict], image_cache: d
         k = normalize_key(p.get("name", ""))
         market = normalize_market(p.get("market", ""))
         hk = f"{k}|{market}"
-        if end and end >= today and hk not in entries and k:
+        if end and end >= today and hk not in entries and k and market not in EXCLUDED_MARKETS:
             entries[hk] = {
                 "key": k, "name": clean_text(p.get("name")), "category": p.get("category", "Ərzaq"), "market": market,
                 "source": clean_text(p.get("source") or "Veb sayt", 30), "price": safe_float(p.get("price"), 0),
