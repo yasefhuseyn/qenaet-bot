@@ -600,6 +600,15 @@ def gemini_confirms_brand(client, url: str, name: str, kind: str) -> bool:
         else:
             q = (f'Bu şəkil "{name}" bankının plastik ödəniş kartının təmiz görüntüsüdürmü? Bank adı/loqosu uyğun olmalı; '
                  'insan, bannerdə mətn, xəbər şəkli və ya başqa bank olarsa uyğun DEYİL. YALNIZ JSON: {"match": true} və ya {"match": false}')
+        try:
+            from PIL import Image
+            import io
+            w, h = Image.open(io.BytesIO(r.content)).size
+            if (kind == "card" and (w < 300 or h < 170)) or (kind == "logo" and (w < 96 or h < 96)):
+                log.info("  [Brend yoxlama] %s/%s çox kiçik (%dx%d)", name, kind, w, h)
+                return False
+        except Exception:
+            pass
         STATS["brand_verified"] += 1
         ok = extract_json_object(gemini_text(client, [q, types.Part.from_bytes(data=r.content, mime_type=mime)])).get("match") is True
         log.info("  [Brend yoxlama] %s/%s → %s %s", name, kind, "OK" if ok else "uyğun deyil", url[:80])
