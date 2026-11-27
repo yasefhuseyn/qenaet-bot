@@ -84,10 +84,10 @@ def env_int(name: str, default: int) -> int:
         return default
 
 
-IG_POSTS = env_int("IG_POSTS_PER_PAGE", 6)
-FB_POSTS = env_int("FB_POSTS_PER_PAGE", 8)
-TG_POSTS = env_int("TG_POSTS_PER_CHANNEL", 20)
-VISION_MAX = env_int("VISION_MAX_IMAGES", 100)
+IG_POSTS = env_int("IG_POSTS_PER_PAGE", 10)
+FB_POSTS = env_int("FB_POSTS_PER_PAGE", 12)
+TG_POSTS = env_int("TG_POSTS_PER_CHANNEL", 30)
+VISION_MAX = env_int("VISION_MAX_IMAGES", 220)
 VISION_PER_CALL = 4        # bir Gemini sorğusunda neçə şəkil oxunsun
 VISION_PER_MARKET = 10     # hər saytdan maksimum promo şəkli
 BAZAR_MAX = env_int("BAZAR_MAX_PRODUCTS", 240)
@@ -99,7 +99,7 @@ CROP_DIR = "product_images"
 CROP_RAW_BASE = "https://raw.githubusercontent.com/yasefhuseyn/qenaet-bot/main/" + CROP_DIR + "/"
 CATALOG_IMAGES: list[dict] = []   # vision zamanı "kataloq" kimi tanınan şəkillər
 MAX_PRODUCTS = 300
-MAX_AGE_DAYS = 10          # bundan köhnə sosial şəbəkə paylaşımları atılır
+MAX_AGE_DAYS = 14          # bundan köhnə sosial şəbəkə paylaşımları atılır
 MIN_PRICE, MAX_PRICE = 0.05, 300.0
 GEMINI_BATCH_CHARS = 22000
 GEMINI_MAX_BATCHES = 4
@@ -1618,6 +1618,7 @@ def scrape_one_telegram(market: str, slug: str) -> tuple[list[dict], list[dict]]
             posts.append({"text": text[:500], "imageUrl": img})
         if img:
             vision.append({"market": market, "source": "Telegram kanalı", "imageUrl": img, "caption": cap_text[:700]})
+    log.info("  [Kanal] %s (t.me/%s): %d yeni paylaşım, %d şəkilli", market, slug, len(posts) or 0, len(vision))
     blocks = [{"market": market, "source": "Telegram kanalı", "posts": posts}] if posts else []
     return blocks, vision
 
@@ -1920,6 +1921,15 @@ def extract_from_promo_images_vision(client, candidates: list[dict]) -> list[dic
     seen, by_market = set(), {}
     captions: dict[str, str] = {}
     from_caption = []
+    # hər market/mənbə (kanal, səhifə) bərabər paya malik olsun: növbə ilə seç
+    _buckets: dict = {}
+    for _c in candidates:
+        _buckets.setdefault((_c.get("market"), _c.get("source")), []).append(_c)
+    candidates = []
+    while any(_buckets.values()):
+        for _k in list(_buckets):
+            if _buckets[_k]:
+                candidates.append(_buckets[_k].pop(0))
     for cand in candidates:
         url = cand.get("imageUrl")
         if not url or url in seen or len(seen) >= VISION_MAX:
@@ -1934,6 +1944,13 @@ def extract_from_promo_images_vision(client, candidates: list[dict]) -> list[dic
         if cap:
             captions[url] = cap[:300]
         by_market.setdefault((cand["market"], cand.get("source", "Sosial şəbəkə")), []).append(url)
+    for (_m, _src), _urls in by_market.items():
+        log.info("  [Mənbə] %s / %s: şəkildən oxunacaq %d paylaşım", _m, _src, len(_urls))
+    _cap_by = {}
+    for _it in from_caption:
+        _cap_by[(_it.get("market"), _it.get("source"))] = _cap_by.get((_it.get("market"), _it.get("source")), 0) + 1
+    for (_m, _src), _n in _cap_by.items():
+        log.info("  [Mənbə] %s / %s: yazıdan oxunan %d paylaşım", _m, _src, _n)
     cap_ok = check_caption_items(client, from_caption) if from_caption else []
     for it in cap_ok:
         it["imageUrl"], it["imgSrc"] = it.pop("_img"), "source"
@@ -2183,12 +2200,14 @@ def build_products(raw_items: list[dict], prev_items: list[dict], image_cache: d
         k = normalize_key(p.get("name", ""))
         market = normalize_market(p.get("market", ""))
         hk = f"{k}|{market}"
-        if end and end >= today and hk not in entries and k and market not in EXCLUDED_MARKETS:
+        seen_d = str(p.get("seenDate") or "")
+        keep_noend = (not end) and seen_d and seen_d >= (datetime.now(timezone(timedelta(hours=4))) - timedelta(days=7)).strftime("%Y-%m-%d")
+        if ((end and end >= today) or keep_noend) and hk not in entries and k and market not in EXCLUDED_MARKETS:
             entries[hk] = {
                 "key": k, "name": clean_text(p.get("name")), "category": p.get("category", "Ərzaq"), "market": market,
                 "source": clean_text(p.get("source") or "Veb sayt", 30), "price": safe_float(p.get("price"), 0),
                 "oldPrice": safe_float(p.get("oldPrice"), 0) or 0, "unit": clean_text(p.get("unit") or "1 ədəd", 25),
-                "imageUrl": p.get("imageUrl") or "", "imgSrc": p.get("imgSrc") or "", "endDate": end, "carried": True,
+                "imageUrl": p.get("imageUrl") or "", "imgSrc": p.get("imgSrc") or "", "endDate": end, "carried": True, "seenDate": p.get("seenDate") or today,
             }
             carried += 1
     if carried:
@@ -2301,13 +2320,14 @@ def build_products(raw_items: list[dict], prev_items: list[dict], image_cache: d
             "oldPrice": e["oldPrice"], "price": e["price"], "unit": e["unit"], "imageUrl": e["imageUrl"], "imgSrc": e.get("imgSrc", ""),
             "endDate": e["endDate"], "svgType": pick_svg_type(e["category"], e["name"]),
             "iconBg": "from-emerald-50 to-teal-100 dark:from-emerald-950/60 dark:to-teal-900/40",
+            "seenDate": (prev or {}).get("seenDate") or e.get("seenDate") or today,
             "aiMatch": match, "comparisons": comps, "history30": hist, "histKey": hk, "histDate": today,
         })
 
     def discount(p):
         return (p["oldPrice"] - p["price"]) / p["oldPrice"] if p["oldPrice"] else 0
 
-    products = [p for p in products if p.get("imageUrl")]   # şəkilsiz məhsul əlavə olunmur
+    products = [p for p in products if p.get("imageUrl") and not (p.get("endDate") and str(p["endDate"]) < today)]   # şəkilsiz və vaxtı bitmiş məhsul əlavə olunmur
     products.sort(key=lambda p: (-discount(p), p["price"]))
     return products[:MAX_PRODUCTS], drops
 

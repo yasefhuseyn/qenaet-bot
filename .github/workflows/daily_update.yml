@@ -2,7 +2,9 @@ name: Qenaet Daily Catalog Update
 
 on:
   schedule:
-    - cron: '10 20 * * *'
+    - cron: '10 20 * * *'   # 00:10 Bakı — Apify ilə tam
+    - cron: '10 8 * * *'    # 12:10 Bakı — Apify ilə tam
+    - cron: '10 0,4,12,16 * * *'   # 04:10, 08:10, 16:10, 20:10 Bakı — yüngül (Telegram + saytlar)
   workflow_dispatch:
     inputs:
       dry_run:
@@ -37,6 +39,16 @@ jobs:
           cache: pip
       - name: Paketləri quraşdır
         run: pip install -r requirements.txt
+      - name: Rejimi təyin et (Apify yalnız tam işləmələrdə)
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            case "${{ github.event.schedule }}" in
+              "10 20 * * *"|"10 8 * * *") echo "USE_APIFY=1" >> "$GITHUB_ENV" ;;
+              *) echo "USE_APIFY=0" >> "$GITHUB_ENV" ;;
+            esac
+          else
+            echo "USE_APIFY=${{ inputs.use_apify == false && '0' || '1' }}" >> "$GITHUB_ENV"
+          fi
       - name: Gündəlik yeniləməni işə sal
         env:
           FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
@@ -46,7 +58,6 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           CLEAR_CATALOG: ${{ inputs.clear_catalog && '1' || '0' }}
           DRY_RUN: ${{ inputs.dry_run && '1' || '0' }}
-          USE_APIFY: ${{ inputs.use_apify == false && '0' || '1' }}
         run: python daily_updater.py
       - name: Nəticəni saxla (sınaq rejimi)
         if: ${{ inputs.dry_run }}
