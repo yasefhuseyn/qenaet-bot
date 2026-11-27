@@ -94,12 +94,12 @@ VISION_PER_MARKET = 10     # hər saytdan maksimum promo şəkli
 BAZAR_MAX = env_int("BAZAR_MAX_PRODUCTS", 240)
 EXTRA_PAGES = env_int("EXTRA_PAGES_PER_MARKET", 3)
 IMAGE_SEARCH_MAX = env_int("IMAGE_SEARCH_MAX", 60)
-CATALOG_MAX_IMAGES = env_int("CATALOG_MAX_IMAGES", 20)     # bir işləmədə kəsilən kataloq şəkli sayı
-CATALOG_MAX_CROPS = env_int("CATALOG_MAX_CROPS", 80)       # bir işləmədə kəsilən məhsul şəkli sayı
+CATALOG_MAX_IMAGES = env_int("CATALOG_MAX_IMAGES", 60)     # bir işləmədə kəsilən kataloq şəkli sayı
+CATALOG_MAX_CROPS = env_int("CATALOG_MAX_CROPS", 250)       # bir işləmədə kəsilən məhsul şəkli sayı
 CROP_DIR = "product_images"
 CROP_RAW_BASE = "https://raw.githubusercontent.com/yasefhuseyn/qenaet-bot/main/" + CROP_DIR + "/"
 CATALOG_IMAGES: list[dict] = []   # vision zamanı "kataloq" kimi tanınan şəkillər
-MAX_PRODUCTS = 300
+MAX_PRODUCTS = 600
 MAX_AGE_DAYS = 14          # bundan köhnə sosial şəbəkə paylaşımları atılır
 MIN_PRICE, MAX_PRICE = 0.05, 300.0
 GEMINI_BATCH_CHARS = 22000
@@ -2252,6 +2252,37 @@ def build_products(raw_items: list[dict], prev_items: list[dict], image_cache: d
     if carried:
         log.info("  Bitmə tarixi çatmamış %d əvvəlki endirim saxlanıldı", carried)
 
+    # 3b. Eyni marketin eyni məhsulunun təkrar (üst-üstə düşən) paylaşımlarını birləşdir
+    def _toks(e):
+        return set(re.findall(r"[a-z0-9əöüğçşı]{2,}", (e.get("name") or "").lower()))
+    ent_list = list(entries.items())
+    drop_keys = set()
+    by_mk: dict[str, list] = {}
+    for hk_, e_ in ent_list:
+        by_mk.setdefault(e_["market"], []).append((hk_, e_))
+    for mk_, lst in by_mk.items():
+        for i in range(len(lst)):
+            if lst[i][0] in drop_keys:
+                continue
+            for j in range(i + 1, len(lst)):
+                if lst[j][0] in drop_keys:
+                    continue
+                a_, b_ = lst[i][1], lst[j][1]
+                ta, tb = _toks(a_), _toks(b_)
+                if not ta or not tb:
+                    continue
+                jac = len(ta & tb) / len(ta | tb)
+                same_price = abs((a_["price"] or 0) - (b_["price"] or 0)) < 0.006
+                if jac >= 0.9 or (jac >= 0.7 and same_price):
+                    def score(x):
+                        return (bool(x.get("imageUrl")), bool(x.get("endDate")), -(x.get("price") or 0), len(x.get("name") or ""))
+                    loser = lst[j][0] if score(a_) >= score(b_) else lst[i][0]
+                    drop_keys.add(loser)
+    for k_ in drop_keys:
+        entries.pop(k_, None)
+    if drop_keys:
+        log.info("  Təkrar paylaşımlar birləşdirildi: %d", len(drop_keys))
+
     # 4. Marketlər arası qruplaşdırma
     groups = group_entries(list(entries.values()))
     # Başqa marketlərin TAM kataloqundan (adi + endirimli cari qiymət) eyni məhsulu tap
@@ -2269,14 +2300,14 @@ def build_products(raw_items: list[dict], prev_items: list[dict], image_cache: d
             if idx is not None and idx.entries:
                 f_ = idx.find(g[0]["name"])
                 if f_:
-                    extra_comps.setdefault(hk0, []).append({"market": mk, "price": f_["price"], "isPromo": bool(f_["old"])})
+                    extra_comps.setdefault(hk0, []).append({"market": mk, "price": f_["price"], "isPromo": bool(f_["old"]), "name": clean_text(f_["name"], 90)})
             elif mk == "Bazarstore":
                 todo_old.append((hk0, g))
     if todo_old:   # kataloq alınmayıbsa köhnə üsul: Bazarstore axtarışı
         with ThreadPoolExecutor(max_workers=8) as pool:
             for (hk0, g), found in zip(todo_old[:BAZAR_LOOKUP_MAX], pool.map(lambda t: bazar_regular_lookup(t[1][0]["name"]), todo_old[:BAZAR_LOOKUP_MAX])):
                 if found:
-                    extra_comps.setdefault(hk0, []).append({"market": "Bazarstore", "price": found["price"], "isPromo": bool(found.get("oldPrice"))})
+                    extra_comps.setdefault(hk0, []).append({"market": "Bazarstore", "price": found["price"], "isPromo": bool(found.get("oldPrice")), "name": clean_text(found.get("name") or "", 90)})
     log.info("  Tam kataloqdan müqayisə: %d məhsul qrupu üçün əlavə qiymət tapıldı", len(extra_comps))
 
     # 5. Şəkillər: öz şəkli → əvvəlki şəkil → keş → internet axtarışı
@@ -2344,7 +2375,7 @@ def build_products(raw_items: list[dict], prev_items: list[dict], image_cache: d
         if prev and not e.get("carried") and safe_float(prev.get("price")) and e["price"] < safe_float(prev["price"]) - 0.005:
             drops.append({"id": "p_" + short_hash(hk), "name": e["name"], "market": e["market"], "oldPrice": safe_float(prev["price"]), "price": e["price"]})
 
-        comps = [{"market": g["market"], "price": g["price"], "isPromo": True} for g in groups[hk]]
+        comps = [{"market": g["market"], "price": g["price"], "isPromo": True, "name": clean_text(g["name"], 90), "hk": f"{g['key']}|{g['market']}"} for g in groups[hk]]
         have = {c["market"] for c in comps}
         for k2 in [hk] + [f"{x['key']}|{x['market']}" for x in groups[hk]]:
             for ex in extra_comps.get(k2, []):
@@ -2362,6 +2393,13 @@ def build_products(raw_items: list[dict], prev_items: list[dict], image_cache: d
             "seenDate": (prev or {}).get("seenDate") or e.get("seenDate") or today,
             "aiMatch": match, "comparisons": comps, "history30": hist, "histKey": hk, "histDate": today,
         })
+
+    id_by_hk = {p_["histKey"]: p_["id"] for p_ in products}
+    for p_ in products:
+        for c_ in p_["comparisons"]:
+            h_ = c_.pop("hk", None)
+            if h_ and h_ in id_by_hk and c_["market"] != p_["market"]:
+                c_["pid"] = id_by_hk[h_]
 
     def discount(p):
         return (p["oldPrice"] - p["price"]) / p["oldPrice"] if p["oldPrice"] else 0
