@@ -2307,6 +2307,7 @@ def build_products(raw_items: list[dict], prev_items: list[dict], image_cache: d
     def discount(p):
         return (p["oldPrice"] - p["price"]) / p["oldPrice"] if p["oldPrice"] else 0
 
+    products = [p for p in products if p.get("imageUrl")]   # şəkilsiz məhsul əlavə olunmur
     products.sort(key=lambda p: (-discount(p), p["price"]))
     return products[:MAX_PRODUCTS], drops
 
@@ -2556,6 +2557,19 @@ def main():
         client = genai.Client(api_key=api_key)
     pick_models(client)
     db = None if dry else init_firestore()
+    if os.environ.get("CLEAR_CATALOG", "").strip() == "1":
+        if db is None:
+            log.warning("Sınaq rejimində silmə yoxdur.")
+            return
+        now_l = datetime.now(timezone(timedelta(hours=4))).strftime("%d.%m.%Y %H:%M")
+        write_doc(db, "daily_discounts", {"updatedLabel": f"Təmizləndi: {now_l}", "date": "", "count": 0, "items": [], "cleared": True}, False)
+        n_del = 0
+        for d_ in db.collection("catalog").stream():
+            if d_.id.startswith("market_prices_") or d_.id in ("daily_changes",):
+                d_.reference.delete()
+                n_del += 1
+        log.info("Bütün məhsullar silindi (daily_discounts boşaldıldı, %d kataloq sənədi silindi).", n_del)
+        return
     now = datetime.now(BAKU_TZ)
     today, now_label = now.strftime("%Y-%m-%d"), now.strftime("%d.%m.%Y %H:%M")
     started = time.time()
