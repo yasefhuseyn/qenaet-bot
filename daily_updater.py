@@ -1905,7 +1905,9 @@ def check_caption_items(client, items: list[dict]) -> list[dict]:
             return None
         read_price = safe_float(res.get("price"), 0) or 0
         if read_price and abs(read_price - it["price"]) > 0.011 and abs(read_price - (it.get("oldPrice") or -1)) > 0.011:
-            log.info("  [Yazı≠şəkil] %s: yazıda %.2f, şəkildə %.2f — atıldı", it["name"][:40], it["price"], read_price)
+            log.info("  [Yazı≠şəkil] %s: yazıda %.2f, şəkildə %.2f — kataloq bölməsinə göndərildi", it["name"][:40], it["price"], read_price)
+            if all(c["url"] != it["_img"] for c in CATALOG_IMAGES):   # yazıdakı rəqəm məhsulun qiyməti deyil; şəkil çox güman ki, kolajdır
+                CATALOG_IMAGES.append({"market": it["market"], "source": it["source"], "url": it["_img"]})
             return None
         return it
 
