@@ -2687,13 +2687,26 @@ def main():
     brand_logos = collect_brand_logos(existing_logos, client)
     write_doc(db, "brand_assets", {"updatedLabel": f"Yeniləndi: {now_label}", "version": LOGO_VERSION, "logos": brand_logos, "cards": card_images}, dry)
 
-    log.info("2. Market saytları skan edilir (endirim səhifələri avtomatik tapılır)...")
-    web_blocks, structured, socials, tg_channels, web_vision = scrape_market_websites()
-    log.info("2b. Bazarstore və Araz endirim məlumatları (API/səhifələr)...")
-    structured += with_retry(scrape_bazarstore, "Bazarstore", default=[]) + with_retry(scrape_araz, "Araz", default=[])
-    log.info("2c. Bazarstore və Araz TAM kataloqu arxa planda yığılır (müqayisə üçün)...")
-    catalog_pool = ThreadPoolExecutor(max_workers=1)
-    catalog_future = catalog_pool.submit(scrape_full_catalogs)
+    TG_ONLY = os.environ.get("TELEGRAM_ONLY", "1").strip() != "0"
+    if TG_ONLY:
+        log.info("2. YALNIZ TELEGRAM rejimi: market saytları və kataloqlar ötürülür.")
+        web_blocks, structured, web_vision = [], [], []
+        socials = {k: dict(v) for k, v in DEFAULT_SOCIAL_URLS.items()}
+        tg_channels = dict(TELEGRAM_CHANNELS)
+        for pair in (os.environ.get("TELEGRAM_EXTRA") or "").split(","):
+            if ":" in pair:
+                m_, slug_ = pair.split(":", 1)
+                tg_channels[m_.strip()] = slug_.strip().lstrip("@")
+        catalog_future = None
+        apify_token = ""
+    else:
+        log.info("2. Market saytları skan edilir (endirim səhifələri avtomatik tapılır)...")
+        web_blocks, structured, socials, tg_channels, web_vision = scrape_market_websites()
+        log.info("2b. Bazarstore və Araz endirim məlumatları (API/səhifələr)...")
+        structured += with_retry(scrape_bazarstore, "Bazarstore", default=[]) + with_retry(scrape_araz, "Araz", default=[])
+        log.info("2c. Bazarstore və Araz TAM kataloqu arxa planda yığılır (müqayisə üçün)...")
+        catalog_pool = ThreadPoolExecutor(max_workers=1)
+        catalog_future = catalog_pool.submit(scrape_full_catalogs)
 
     ig_blocks, ig_vision, fb_blocks, fb_vision = [], [], [], []
     if apify_token:
@@ -2734,7 +2747,7 @@ def main():
 
     catalogs = {}
     try:
-        full = catalog_future.result(timeout=max(60, CATALOG_BUDGET_SEC + 120 - int(time.time() - started)))
+        full = catalog_future.result(timeout=max(60, CATALOG_BUDGET_SEC + 120 - int(time.time() - started))) if catalog_future else {}
     except Exception as exc:
         log.warning("  [Tam kataloq] gözləmə xətası: %s", str(exc)[:120])
         full = {}
@@ -2742,7 +2755,7 @@ def main():
         doc_name = "market_prices_" + mk.lower()
         if items_:
             write_doc(db, doc_name, {"updatedLabel": f"Yeniləndi: {now_label}", "date": today, "count": len(items_), "items": items_[:CATALOG_MAX_ITEMS]}, dry)
-        else:   # alınmadısa dünənki kataloqdan istifadə et
+        elif not TG_ONLY:   # alınmadısa dünənki kataloqdan istifadə et
             items_ = [x for x in read_doc(db, doc_name).get("items", []) if isinstance(x, dict) and x.get("n")]
             if items_:
                 log.info("  [Tam kataloq] %s: bu gün alınmadı, əvvəlki kataloq istifadə olunur (%d)", mk, len(items_))
