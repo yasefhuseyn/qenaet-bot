@@ -18,7 +18,7 @@ on:
       use_apify:
         description: 'Apify (Instagram/Facebook) istifadə olunsun (kredit xərcləyir)'
         type: boolean
-        default: true
+        default: false
 
 permissions:
   contents: write
@@ -41,13 +41,11 @@ jobs:
         run: pip install -r requirements.txt
       - name: Rejimi təyin et (Apify yalnız tam işləmələrdə)
         run: |
-          if [ "${{ github.event_name }}" = "schedule" ]; then
-            case "${{ github.event.schedule }}" in
-              "10 20 * * *"|"10 8 * * *") echo "USE_APIFY=1" >> "$GITHUB_ENV" ;;
-              *) echo "USE_APIFY=0" >> "$GITHUB_ENV" ;;
-            esac
+          # Fokus Telegram kanallarındadır; Instagram/Facebook (Apify) yalnız əllə, "use_apify" seçiləndə işləyir
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "USE_APIFY=${{ inputs.use_apify == true && '1' || '0' }}" >> "$GITHUB_ENV"
           else
-            echo "USE_APIFY=${{ inputs.use_apify == false && '0' || '1' }}" >> "$GITHUB_ENV"
+            echo "USE_APIFY=0" >> "$GITHUB_ENV"
           fi
       - name: Gündəlik yeniləməni işə sal
         env:

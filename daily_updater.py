@@ -86,8 +86,9 @@ def env_int(name: str, default: int) -> int:
 
 IG_POSTS = env_int("IG_POSTS_PER_PAGE", 10)
 FB_POSTS = env_int("FB_POSTS_PER_PAGE", 12)
+TG_PAGES = env_int("TG_PAGES_PER_CHANNEL", 10)   # hər səhifədə ~20 paylaşım
 TG_POSTS = env_int("TG_POSTS_PER_CHANNEL", 30)
-VISION_MAX = env_int("VISION_MAX_IMAGES", 220)
+VISION_MAX = env_int("VISION_MAX_IMAGES", 400)
 VISION_PER_CALL = 4        # bir Gemini sorğusunda neçə şəkil oxunsun
 VISION_PER_MARKET = 10     # hər saytdan maksimum promo şəkli
 BAZAR_MAX = env_int("BAZAR_MAX_PRODUCTS", 240)
@@ -1595,30 +1596,59 @@ def scrape_facebook_via_apify(token: str, socials: dict) -> tuple[list[dict], li
 
 # --------------------------------------------------------------------------- Telegram
 def scrape_one_telegram(market: str, slug: str) -> tuple[list[dict], list[dict]]:
-    html = fetch_html(f"https://t.me/s/{slug}", timeout=15)
-    if not html:
-        return [], []
-    soup = BeautifulSoup(html, "html.parser")
+    """Kanalın son MAX_AGE_DAYS günlük bütün paylaşımlarını oxuyur (səhifə-səhifə, ?before= ilə geriyə)."""
     posts, vision = [], []
-    for wrap in soup.select(".tgme_widget_message_wrap")[-TG_POSTS:]:
-        time_el = wrap.select_one("time")
-        if not is_recent(time_el.get("datetime") if time_el else None):
-            continue
-        txt_el = wrap.select_one(".tgme_widget_message_text")
-        text = txt_el.get_text(" ", strip=True) if txt_el else ""
-        img = ""
-        photo = wrap.select_one(".tgme_widget_message_photo_wrap")
-        if photo and photo.get("style"):
-            m = re.search(r"url\(['\"]?(https?://[^'\")]+)", photo["style"])
-            if m:
-                img = m.group(1)
-        STATS["tg_posts"] += 1
-        cap_text = txt_el.get_text("\n", strip=True) if txt_el else ""
-        if len(text) > 15:
-            posts.append({"text": text[:500], "imageUrl": img})
-        if img:
-            vision.append({"market": market, "source": "Telegram kanalı", "imageUrl": img, "caption": cap_text[:700]})
-    log.info("  [Kanal] %s (t.me/%s): %d yeni paylaşım, %d şəkilli", market, slug, len(posts) or 0, len(vision))
+    seen_ids, before, n_pages, total = set(), None, 0, 0
+    while n_pages < TG_PAGES:
+        url = f"https://t.me/s/{slug}" + (f"?before={before}" if before else "")
+        html = fetch_html(url, timeout=15)
+        if not html:
+            break
+        soup = BeautifulSoup(html, "html.parser")
+        wraps = soup.select(".tgme_widget_message_wrap")
+        if not wraps:
+            break
+        n_pages += 1
+        ids, any_recent = [], False
+        for wrap in wraps:
+            msg = wrap.select_one(".tgme_widget_message")
+            pid = 0
+            if msg and msg.get("data-post"):
+                try:
+                    pid = int(str(msg["data-post"]).rsplit("/", 1)[-1])
+                except ValueError:
+                    pid = 0
+            if pid:
+                ids.append(pid)
+                if pid in seen_ids:
+                    continue
+                seen_ids.add(pid)
+            time_el = wrap.select_one("time")
+            if not is_recent(time_el.get("datetime") if time_el else None):
+                continue
+            any_recent = True
+            txt_el = wrap.select_one(".tgme_widget_message_text")
+            text = txt_el.get_text(" ", strip=True) if txt_el else ""
+            img = ""
+            photo = wrap.select_one(".tgme_widget_message_photo_wrap")
+            if photo and photo.get("style"):
+                m = re.search(r"url\(['\"]?(https?://[^'\")]+)", photo["style"])
+                if m:
+                    img = m.group(1)
+            STATS["tg_posts"] += 1
+            total += 1
+            cap_text = txt_el.get_text("\n", strip=True) if txt_el else ""
+            if len(text) > 15:
+                posts.append({"text": text[:500], "imageUrl": img})
+            if img:
+                vision.append({"market": market, "source": "Telegram kanalı", "imageUrl": img, "caption": cap_text[:700]})
+        if not any_recent or not ids or min(ids) <= 1:
+            break
+        nb = min(ids)
+        if nb == before:
+            break
+        before = nb
+    log.info("  [Kanal] %s (t.me/%s): %d səhifə, %d paylaşım, %d şəkilli", market, slug, n_pages, total, len(vision))
     blocks = [{"market": market, "source": "Telegram kanalı", "posts": posts}] if posts else []
     return blocks, vision
 
