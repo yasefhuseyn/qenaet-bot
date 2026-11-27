@@ -1903,8 +1903,12 @@ def parse_caption_item(text: str):
             break
     if not name:
         return None
+    # "təmiz" yazı: qısa məhsul adı, ümumi/kampaniya sözləri yox, qiymət yazıda təkdir — Gemini yoxlaması tələb olunmur
+    words = name.split()
+    generic = re.search(r"market\w*|şəbəkə\w*|alış|çox|xüsusi|hədiyyə|bonus|kart|kampaniya|mağaza|filial|ünvan|yeni açıl|nömrə|tel\b|whatsapp", name, re.I)
+    clean = 1 <= len(words) <= 7 and not generic and len(prices) <= 2 and (old == 0 or old > price)
     return {"name": name, "price": price, "oldPrice": old, "unit": "1 ədəd", "category": "Ərzaq",
-            "endDate": parse_end_date(text)}
+            "endDate": parse_end_date(text), "clean": clean}
 
 
 def check_caption_items(client, items: list[dict]) -> list[dict]:
@@ -1983,7 +1987,10 @@ def extract_from_promo_images_vision(client, candidates: list[dict]) -> list[dic
         _cap_by[(_it.get("market"), _it.get("source"))] = _cap_by.get((_it.get("market"), _it.get("source")), 0) + 1
     for (_m, _src), _n in _cap_by.items():
         log.info("  [Mənbə] %s / %s: yazıdan oxunan %d paylaşım", _m, _src, _n)
-    cap_ok = check_caption_items(client, from_caption) if from_caption else []
+    clean_items = [it for it in from_caption if it.get("clean")]
+    check_items = [it for it in from_caption if not it.get("clean")]
+    cap_ok = clean_items + (check_caption_items(client, check_items) if check_items else [])
+    log.info("  [Yazıdan oxuma] %d paylaşım Gemini yoxlaması olmadan birbaşa götürüldü, %d yoxlandı", len(clean_items), len(check_items))
     for it in cap_ok:
         it["imageUrl"], it["imgSrc"] = it.pop("_img"), "source"
     STATS["caption_items"] = len(cap_ok)
