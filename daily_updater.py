@@ -96,7 +96,7 @@ VISION_PER_CALL = 4        # bir Gemini sorğusunda neçə şəkil oxunsun
 VISION_PER_MARKET = 10     # hər saytdan maksimum promo şəkli
 BAZAR_MAX = env_int("BAZAR_MAX_PRODUCTS", 240)
 EXTRA_PAGES = env_int("EXTRA_PAGES_PER_MARKET", 3)
-IMAGE_SEARCH_MAX = env_int("IMAGE_SEARCH_MAX", 60)
+IMAGE_SEARCH_MAX = env_int("IMAGE_SEARCH_MAX", 350)
 CATALOG_MAX_IMAGES = env_int("CATALOG_MAX_IMAGES", 60)     # bir işləmədə kəsilən kataloq şəkli sayı
 CATALOG_MAX_CROPS = env_int("CATALOG_MAX_CROPS", 250)       # bir işləmədə kəsilən məhsul şəkli sayı
 CROP_DIR = "product_images"
@@ -111,10 +111,10 @@ GEMINI_MIN_INTERVAL = 4.0  # saniyə (pulsuz limitə uyğun)
 LOGO_VERSION = 4           # dəyişəndə bütün loqolar yenidən yoxlanılır
 IMAGE_CACHE_VERSION = 2    # dəyişəndə köhnə (yanlış ola bilən) şəkil keşi silinir
 BAZAR_LOOKUP_MAX = env_int("BAZAR_LOOKUP_MAX", 300)
-VERIFY_MAX = env_int("VISION_VERIFY_MAX", 60)   # axtarışla tapılan şəkilləri AI ilə yoxlama limiti
+VERIFY_MAX = env_int("VISION_VERIFY_MAX", 250)   # axtarışla tapılan şəkilləri AI ilə yoxlama limiti
 NEG_CACHE_DAYS = 14        # uyğun şəkil tapılmayan məhsul bu müddət təkrar axtarılmır
 _verify_used = 0
-IMAGE_BUDGET_SEC = env_int("IMAGE_BUDGET_SEC", 480)   # şəkil axtarışı üçün ümumi vaxt limiti
+IMAGE_BUDGET_SEC = env_int("IMAGE_BUDGET_SEC", 2400)   # şəkil axtarışı üçün ümumi vaxt limiti
 _img_started = 0.0
 
 WATERMARK_DOMAINS = (
@@ -474,7 +474,7 @@ def vision_confirms_product(client, image_url: str, product_name: str) -> bool:
     """Gemini şəkilə baxıb bunun həqiqətən həmin məhsulun təmiz şəkli olub-olmadığını deyir."""
     global _verify_used
     if client is None or types is None or _verify_used >= VERIFY_MAX:
-        return False
+        return None   # yoxlama mümkün deyil (kvota/limit)
     try:
         r = SESSION.get(image_url, timeout=10)
         if r.status_code != 200 or len(r.content) > 3_000_000:
@@ -491,10 +491,13 @@ def vision_confirms_product(client, image_url: str, product_name: str) -> bool:
             'YALNIZ JSON qaytar: {"match": true} və ya {"match": false}'
         )
         resp = gemini_text(client, [prompt, types.Part.from_bytes(data=r.content, mime_type=mime)])
-        return extract_json_object(resp).get("match") is True
+        obj = extract_json_object(resp)
+        if "match" not in obj:
+            return None
+        return obj.get("match") is True
     except Exception as exc:
         log.warning("  [Şəkil yoxlaması] %s: %s", product_name, exc)
-        return False
+        return None
 
 
 MARKET_IMAGE_DOMAINS = ("almarket.az", "bazarstore.az", "arazmarket.az", "oba.az", "obafiles", "bravosupermarket.az",
@@ -520,7 +523,7 @@ def find_high_quality_product_image(product_name: str, image_cache: dict, client
     global _img_started
     if not _img_started:
         _img_started = time.time()
-    if DDGS is None or client is None or _verify_used >= VERIFY_MAX or time.time() - _img_started > IMAGE_BUDGET_SEC:
+    if DDGS is None or time.time() - _img_started > IMAGE_BUDGET_SEC:
         return ""
     STATS["image_searches"] += 1
     need = 2 if len(name_tokens(product_name)) >= 2 else 1
@@ -557,7 +560,10 @@ def find_high_quality_product_image(product_name: str, image_cache: dict, client
         if not verify_image_url(img_url, min_dim=300):
             continue
         checked += 1
-        if vision_confirms_product(client, img_url, product_name):
+        ok_ = vision_confirms_product(client, img_url, product_name)
+        if ok_ is None:   # AI yoxlaması mümkün olmadı: yalnız güclü uyğunluq (market/.az sayt + ad uyğunluğu) qəbul edilir
+            ok_ = scored.get(img_url, 0) >= 12
+        if ok_:
             image_cache[key] = img_url
             return img_url
     if today and _verify_used < VERIFY_MAX:
@@ -2368,6 +2374,9 @@ def build_products(raw_items: list[dict], prev_items: list[dict], image_cache: d
             return e, os.path.exists(os.path.join(CROP_DIR, u[len(CROP_RAW_BASE):]))
         return e, bool(u) and verify_image_url(u, 200)
 
+    for e in entry_list:   # kataloqdan kəsilmiş şəkillər keyfiyyətsizdir: istifadə olunmur, əvəzinə internetdən axtarılır
+        if str(e.get("imageUrl") or "").startswith(CROP_RAW_BASE):
+            e["imageUrl"], e["imgSrc"] = "", ""
     with ThreadPoolExecutor(max_workers=8) as pool:
         for e, ok in pool.map(check, [e for e in entry_list if e["imageUrl"]]):
             if not ok:
@@ -2392,11 +2401,9 @@ def build_products(raw_items: list[dict], prev_items: list[dict], image_cache: d
             e["imgSrc"] = e.get("imgSrc") or "source"
             continue
         prev = prev_index.get(f"{e['key']}|{e['market']}")
-        if (prev and prev.get("imageUrl") and prev.get("imgSrc") in ("source", "verified", "matched")
+        if (prev and prev.get("imageUrl") and not str(prev["imageUrl"]).startswith(CROP_RAW_BASE) and prev.get("imgSrc") in ("source", "verified", "matched")
                 and (not re.search(r"fbcdn|cdninstagram|scontent", prev["imageUrl"]) or image_alive(prev["imageUrl"]))):
             e["imageUrl"], e["imgSrc"] = prev["imageUrl"], prev["imgSrc"]   # yalnız yoxlanmış şəkil təkrar istifadə olunur
-        elif TG_ONLY:
-            pass   # yalnız paylaşımın öz şəkli; internetdən şəkil axtarılmır
         elif (image_cache.get(e["key"]) or "").startswith("https://"):
             e["imageUrl"], e["imgSrc"] = image_cache[e["key"]], "verified"
         elif similar_image(e):
