@@ -2800,6 +2800,15 @@ def main():
         else:
             it["imageUrl"] = ""
     raw_items = structured + vision_items + gemini_items
+    try:   # diaqnostika: seçilmiş marketin (default OBA) mənbə paylaşımları və bot nəyi necə oxuyub
+        dbg_m = os.environ.get("DEBUG_MARKET", "OBA")
+        os.makedirs("out", exist_ok=True)
+        with open("out/debug_market.json", "w", encoding="utf-8") as f_:
+            json.dump({"market": dbg_m,
+                       "candidates": [{k_: v_ for k_, v_ in c_.items()} for c_ in (web_vision + ig_vision + fb_vision + tg_vision) if normalize_market(c_.get("market", "")) == dbg_m],
+                       "items": [i_ for i_ in raw_items if normalize_market(i_.get("market", "")) == dbg_m]}, f_, ensure_ascii=False, indent=1, default=str)
+    except Exception as exc_:
+        log.warning("  debug yazılmadı: %s", str(exc_)[:100])
     log.info("  Xam məhsul: sayt/API %d + Vision %d + Gemini %d", len(structured), len(vision_items), len(gemini_items))
 
     catalogs = {}
