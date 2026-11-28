@@ -1919,8 +1919,17 @@ def parse_start_date(text: str) -> str:
     return d.strftime("%Y-%m-%d")
 
 
+_BOILER_RE = re.compile(r"(?:^|\n|\.\s)\s*qeyd\s*:[^\n]*|\d+\s*(?:azn|₼|manat)\s*(?:və\s*üzəri|və\s*çox|-?\s*lik|-?\s*lıq|dan\s+çox)[^\n.]*|[^\n.]*lotereya[^\n.]*|[^\n.]*obaplus[^\n.]*", re.I)
+
+
+def strip_boilerplate(text: str) -> str:
+    """Kampaniya/lotereya/tətbiq haqqında ümumi qeydləri (məsələn, '10 AZN və üzəri alış-veriş') məhsul qiymətindən ayırır."""
+    return _BOILER_RE.sub(" ", text or "").strip()
+
+
 def parse_caption_item(text: str):
     """Paylaşımın yazısında BİR məhsulun adı və qiyməti açıq yazılıbsa onu qaytarır; yoxsa None (şəkildən oxunacaq)."""
+    text = strip_boilerplate(text)
     if not text or len(text) < 6:
         return None
     prices = []
@@ -2049,22 +2058,41 @@ def extract_from_promo_images_vision(client, candidates: list[dict]) -> list[dic
             loaded = [(u, part) for u, part in loaded if part is not None]
             if not loaded:
                 continue
-            hints = "".join(f"\nŞəkil {n} paylaşımının yazısı: {captions[u]}" for n, (u, _) in enumerate(loaded, 1) if u in captions)
+            hints = "".join(f"\nŞəkil {n} paylaşımının yazısı: {strip_boilerplate(captions[u])[:300]}" for n, (u, _) in enumerate(loaded, 1) if u in captions)
             prompt = (
                 f"Bu {len(loaded)} şəkil {market} marketinin ({source}) paylaşımlarıdır; şəkillər 1-dən {len(loaded)}-ə nömrələnib "
                 "(verilmə sırası ilə). Şəkillərdə konkret qiyməti (AZN / ₼) görünən bütün məhsulları YALNIZ JSON massivi kimi qaytar: "
                 '[{"imageIndex": 1, "layout": "single", "name": "...", "category": "Ərzaq", "oldPrice": 3.5, "price": 2.49, '
-                '"unit": "1 ədəd", "startDate": "2026-12-25", "endDate": "2026-12-31"}]. '
+                '"unit": "1 ədəd", "percent": 22, "startDate": "2026-12-25", "endDate": "2026-12-31"}]. '
                 "layout: şəkildə YALNIZ BİR məhsul (onun öz fotosu, yanında qiymət yazısı ola bilər) varsa \"single\"; "
                 "bir neçə məhsul, kataloq, vərəq, qiymət cədvəli, banner və ya reklam kollajıdırsa \"catalog\". "
                 "name — marka və həcm/çəki ilə tam ad (şəkildə oxuduğun kimi). startDate (başlama) və endDate (bitmə) yalnız şəkildə yazılıbsa (YYYY-MM-DD). "
                 "Əvvəlcə paylaşımın yazısındakı ad, qiymət və tarixə bax (aşağıda verilib), yazıda yoxdursa şəkildəki yazıları oxu. "
+                "QİYMƏT ETİKETLƏRİ: üstündən xətt çəkilmiş (adətən sarı) rəqəm = köhnə qiymət (oldPrice); qırmızı etiketdəki rəqəm = yeni endirimli qiymət (price). "
+                "Etiketdə böyük rəqəm manatın tam hissəsi, yuxarıdakı kiçik rəqəm qəpikdir (böyük 1, kiçik 79 → 1.79). "
+                "Yaşıl 'OBA Plus / üzvlərinə endirimli qiymət' və ya '2 ədədi' etiketi kart-üzvü qiymətidir: onu price kimi YAZMA. "
+                "'22% daha qənaətli' kimi yazı varsa percent=22 yaz. Məhsulun adı adətən şəklin sol tərəfindəki yazıdır (marka + növ + çəki/həcm, məs. 'Ankor Kərə yağı 82.9% 1 kq'); "
+                "unit-i də oradan götür ('1 kq', '380 q'). Lotereya, tətbiq, kampaniya və ya ümumi reklam banneri (qiymət etiketi olmayan) şəkildən heç nə çıxarma. "
+                "endDate yalnız MƏHSULUN endirimi üçün yazılıbsa; lotereya/kampaniya tarixi və '10 AZN və üzəri alış-veriş' kimi şərtlər məhsul qiyməti deyil. "
                 "Qiymət yoxdursa [] qaytar. Heç nə uydurma." + hints
             )
             try:
                 STATS["vision_images"] += len(loaded)
                 rows = [x for x in extract_json_array(gemini_text(client, [prompt] + [p for _, p in loaded]))
                         if isinstance(x, dict) and x.get("name") and x.get("price")]
+                _ok_rows = []
+                for x in rows:   # etiketdəki faiz ilə köhnə/yeni qiymət uyğun gəlməlidir, yoxsa oxuma səhvdir
+                    pr, op, pc = safe_float(x.get("price"), 0) or 0, safe_float(x.get("oldPrice"), 0) or 0, safe_float(x.get("percent"), 0) or 0
+                    if op and pr >= op:
+                        STATS["price_rejected"] = STATS.get("price_rejected", 0) + 1
+                        continue
+                    if op and pc and abs(op * (1 - pc / 100.0) - pr) > max(0.06, pr * 0.03):
+                        log.info("  [Qiymət uyğunsuzluğu] %s: köhnə %.2f, yeni %.2f, %s%% — atıldı", str(x.get("name"))[:40], op, pr, pc)
+                        STATS["price_rejected"] = STATS.get("price_rejected", 0) + 1
+                        continue
+                    x.pop("percent", None)
+                    _ok_rows.append(x)
+                rows = _ok_rows
                 per_img = {}
                 for x in rows:
                     per_img[x.get("imageIndex")] = per_img.get(x.get("imageIndex"), 0) + 1
