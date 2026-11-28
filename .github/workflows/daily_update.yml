@@ -4,7 +4,7 @@ on:
   schedule:
     - cron: '10 20 * * *'   # 00:10 Bakı — Apify ilə tam
     - cron: '10 8 * * *'    # 12:10 Bakı — Apify ilə tam
-    - cron: '10 0,4,12,16 * * *'   # 04:10, 08:10, 16:10, 20:10 Bakı — yüngül (Telegram + saytlar)
+    - cron: '40 0,3,6,9,12,15,18,21 * * *'   # hər 3 saatdan bir — yalnız Telegram (yüngül)
   workflow_dispatch:
     inputs:
       dry_run:
@@ -44,6 +44,8 @@ jobs:
           # Fokus Telegram kanallarındadır; Instagram/Facebook (Apify) yalnız əllə, "use_apify" seçiləndə işləyir
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "USE_APIFY=${{ inputs.use_apify == true && '1' || '0' }}" >> "$GITHUB_ENV"
+          elif [ "${{ github.event.schedule }}" = "10 20 * * *" ] || [ "${{ github.event.schedule }}" = "10 8 * * *" ]; then
+            echo "USE_APIFY=1" >> "$GITHUB_ENV"   # gündə 2 dəfə Instagram + Facebook da oxunur
           else
             echo "USE_APIFY=0" >> "$GITHUB_ENV"
           fi

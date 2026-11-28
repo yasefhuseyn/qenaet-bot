@@ -1874,6 +1874,27 @@ def parse_end_date(text: str) -> str:
     return d.strftime("%Y-%m-%d")
 
 
+def parse_start_date(text: str) -> str:
+    """'26-30 noyabr' → 26 noyabr; '1 dekabrdan' → 1 dekabr kimi başlama tarixini (YYYY-MM-DD) çıxarır."""
+    low = (text or "").lower()
+    m = re.search(r"(\d{1,2})\s*[-–—]\s*(\d{1,2})\s*(" + _MONTH_RE + r")", low)
+    if m:
+        day, mon = int(m.group(1)), AZ_MONTHS[m.group(3)]
+    else:
+        m = re.search(r"(\d{1,2})\s*(" + _MONTH_RE + r")\w*\s*(?:-?(?:dan|dən|tarixindən|tarixindan))", low)
+        if not m:
+            return ""
+        day, mon = int(m.group(1)), AZ_MONTHS[m.group(2)]
+    now = datetime.now(timezone(timedelta(hours=4)))
+    try:
+        d = datetime(now.year, mon, day, tzinfo=now.tzinfo)
+    except ValueError:
+        return ""
+    if d < now - timedelta(days=60):
+        d = d.replace(year=now.year + 1)
+    return d.strftime("%Y-%m-%d")
+
+
 def parse_caption_item(text: str):
     """Paylaşımın yazısında BİR məhsulun adı və qiyməti açıq yazılıbsa onu qaytarır; yoxsa None (şəkildən oxunacaq)."""
     if not text or len(text) < 6:
@@ -1908,7 +1929,7 @@ def parse_caption_item(text: str):
     generic = re.search(r"market\w*|şəbəkə\w*|alış|çox|xüsusi|hədiyyə|bonus|kart|kampaniya|mağaza|filial|ünvan|yeni açıl|nömrə|tel\b|whatsapp", name, re.I)
     clean = 1 <= len(words) <= 7 and not generic and len(prices) <= 2 and (old == 0 or old > price)
     return {"name": name, "price": price, "oldPrice": old, "unit": "1 ədəd", "category": "Ərzaq",
-            "endDate": parse_end_date(text), "clean": clean}
+            "endDate": parse_end_date(text), "startDate": parse_start_date(text), "clean": clean}
 
 
 def check_caption_items(client, items: list[dict]) -> list[dict]:
@@ -2009,10 +2030,10 @@ def extract_from_promo_images_vision(client, candidates: list[dict]) -> list[dic
                 f"Bu {len(loaded)} şəkil {market} marketinin ({source}) paylaşımlarıdır; şəkillər 1-dən {len(loaded)}-ə nömrələnib "
                 "(verilmə sırası ilə). Şəkillərdə konkret qiyməti (AZN / ₼) görünən bütün məhsulları YALNIZ JSON massivi kimi qaytar: "
                 '[{"imageIndex": 1, "layout": "single", "name": "...", "category": "Ərzaq", "oldPrice": 3.5, "price": 2.49, '
-                '"unit": "1 ədəd", "endDate": "2026-12-31"}]. '
+                '"unit": "1 ədəd", "startDate": "2026-12-25", "endDate": "2026-12-31"}]. '
                 "layout: şəkildə YALNIZ BİR məhsul (onun öz fotosu, yanında qiymət yazısı ola bilər) varsa \"single\"; "
                 "bir neçə məhsul, kataloq, vərəq, qiymət cədvəli, banner və ya reklam kollajıdırsa \"catalog\". "
-                "name — marka və həcm/çəki ilə tam ad (şəkildə oxuduğun kimi). endDate yalnız şəkildə yazılıbsa (YYYY-MM-DD). "
+                "name — marka və həcm/çəki ilə tam ad (şəkildə oxuduğun kimi). startDate (başlama) və endDate (bitmə) yalnız şəkildə yazılıbsa (YYYY-MM-DD). "
                 "Əvvəlcə paylaşımın yazısındakı ad, qiymət və tarixə bax (aşağıda verilib), yazıda yoxdursa şəkildəki yazıları oxu. "
                 "Qiymət yoxdursa [] qaytar. Heç nə uydurma." + hints
             )
@@ -2097,13 +2118,13 @@ def gemini_extract_products(client, blocks: list[dict]) -> list[dict]:
             "Qaydalar:\n"
             "1. Yalnız real məhsul adı və rəqəmsal qiyməti olanları götür; heç nə uydurma.\n"
             "2. oldPrice yalnız mətndə köhnə qiymət yazılıbsa doldurulur, yoxdursa boş burax.\n"
-            "3. endDate yalnız mətndə bitmə tarixi yazılıbsa (YYYY-MM-DD), yoxdursa boş burax.\n"
+            "3. startDate (başlama) və endDate (bitmə) yalnız mətndə yazılıbsa (YYYY-MM-DD), yoxdursa boş burax.\n"
             "4. imageUrl yalnız veb sayt blokundakı `images` siyahısından tək məhsulun şəkli ola bilər; "
             "toplu kataloq/post şəkillərini yazma.\n"
             "5. market: Bravo, Araz, Bazarstore, Rahat, OBA, AL Market, Grandmart, Bolmart.\n"
             "6. YALNIZ JSON massivi qaytar (maksimum 60 məhsul). Sahələr: name, category "
             '("Süd məhsulları"|"Ərzaq"|"İçkilər"|"Təmizlik"|"Şirniyyat"), market, '
-            'source ("Instagram"|"Facebook"|"Veb sayt"|"Telegram kanalı"), oldPrice, price, unit, imageUrl, endDate.\n\n'
+            'source ("Instagram"|"Facebook"|"Veb sayt"|"Telegram kanalı"), oldPrice, price, unit, imageUrl, startDate, endDate.\n\n'
             + json.dumps(batch, ensure_ascii=False)
         )
         try:
@@ -2132,6 +2153,9 @@ def clean_item(it: dict, today: str) -> dict | None:
         if raw_end < today:
             return None  # bitmiş endirim
         end_date = raw_end
+    start_date = str(it.get("startDate") or "").strip()[:10]
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", start_date) or (end_date and start_date > end_date):
+        start_date = ""
     cat = clean_text(it.get("category"), 30)
     if cat not in ALLOWED_CATEGORIES or cat == "Ərzaq":
         cat = guess_category(name) if cat in ("", "Ərzaq") or cat not in ALLOWED_CATEGORIES else cat
@@ -2143,7 +2167,7 @@ def clean_item(it: dict, today: str) -> dict | None:
         "key": key, "name": name, "category": cat, "market": normalize_market(it.get("market") or ""),
         "source": clean_text(it.get("source") or "Veb sayt", 30), "price": price, "oldPrice": old,
         "unit": clean_text(it.get("unit") or "1 ədəd", 25), "imageUrl": img if img.startswith("https://") else "",
-        "endDate": end_date, "imgSrc": (it.get("imgSrc") or "") if img.startswith("https://") else "",
+        "endDate": end_date, "startDate": start_date, "imgSrc": (it.get("imgSrc") or "") if img.startswith("https://") else "",
     }
 
 
@@ -2246,11 +2270,15 @@ def build_products(raw_items: list[dict], prev_items: list[dict], image_cache: d
                 "key": k, "name": clean_text(p.get("name")), "category": p.get("category", "Ərzaq"), "market": market,
                 "source": clean_text(p.get("source") or "Veb sayt", 30), "price": safe_float(p.get("price"), 0),
                 "oldPrice": safe_float(p.get("oldPrice"), 0) or 0, "unit": clean_text(p.get("unit") or "1 ədəd", 25),
-                "imageUrl": p.get("imageUrl") or "", "imgSrc": p.get("imgSrc") or "", "endDate": end, "carried": True, "seenDate": p.get("seenDate") or today,
+                "imageUrl": p.get("imageUrl") or "", "imgSrc": p.get("imgSrc") or "", "endDate": end, "startDate": p.get("startDate") or "", "carried": True, "seenDate": p.get("seenDate") or today,
             }
             carried += 1
     if carried:
         log.info("  Bitmə tarixi çatmamış %d əvvəlki endirim saxlanıldı", carried)
+
+    def _src_rank(x):   # Telegram ən yüksək üstünlük, sonra Instagram, sonra Facebook
+        sname = str(x.get("source") or "")
+        return 0 if sname.startswith("Telegram") else 1 if sname.startswith("Instagram") else 2
 
     # 3b. Eyni marketin eyni məhsulunun təkrar (üst-üstə düşən) paylaşımlarını birləşdir
     def _toks(e):
@@ -2273,9 +2301,10 @@ def build_products(raw_items: list[dict], prev_items: list[dict], image_cache: d
                     continue
                 jac = len(ta & tb) / len(ta | tb)
                 same_price = abs((a_["price"] or 0) - (b_["price"] or 0)) < 0.006
-                if jac >= 0.9 or (jac >= 0.7 and same_price):
+                cross = _src_rank(a_) != _src_rank(b_)   # Telegram ↔ Instagram/Facebook: eyni paylaşım təkrarlanmasın
+                if jac >= 0.9 or (jac >= 0.7 and same_price) or (cross and ((jac >= 0.6 and same_price) or jac >= 0.8)):
                     def score(x):
-                        return (bool(x.get("imageUrl")), bool(x.get("endDate")), -(x.get("price") or 0), len(x.get("name") or ""))
+                        return (-_src_rank(x), bool(x.get("imageUrl")), bool(x.get("endDate")), -(x.get("price") or 0), len(x.get("name") or ""))
                     loser = lst[j][0] if score(a_) >= score(b_) else lst[i][0]
                     drop_keys.add(loser)
     for k_ in drop_keys:
@@ -2388,7 +2417,7 @@ def build_products(raw_items: list[dict], prev_items: list[dict], image_cache: d
             "id": "p_" + short_hash(hk),
             "name": e["name"], "category": e["category"], "market": e["market"], "source": e["source"],
             "oldPrice": e["oldPrice"], "price": e["price"], "unit": e["unit"], "imageUrl": e["imageUrl"], "imgSrc": e.get("imgSrc", ""),
-            "endDate": e["endDate"], "svgType": pick_svg_type(e["category"], e["name"]),
+            "endDate": e["endDate"], "startDate": e.get("startDate", ""), "svgType": pick_svg_type(e["category"], e["name"]),
             "iconBg": "from-emerald-50 to-teal-100 dark:from-emerald-950/60 dark:to-teal-900/40",
             "seenDate": (prev or {}).get("seenDate") or e.get("seenDate") or today,
             "aiMatch": match, "comparisons": comps, "history30": hist, "histKey": hk, "histDate": today,
@@ -2689,7 +2718,7 @@ def main():
 
     TG_ONLY = os.environ.get("TELEGRAM_ONLY", "1").strip() != "0"
     if TG_ONLY:
-        log.info("2. YALNIZ TELEGRAM rejimi: market saytları və kataloqlar ötürülür.")
+        log.info("2. YALNIZ sosial mənbələr (Telegram → Instagram → Facebook): saytlar, kataloqlar və PDF-lər ötürülür.")
         web_blocks, structured, web_vision = [], [], []
         socials = {k: dict(v) for k, v in DEFAULT_SOCIAL_URLS.items()}
         tg_channels = dict(TELEGRAM_CHANNELS)
@@ -2698,7 +2727,6 @@ def main():
                 m_, slug_ = pair.split(":", 1)
                 tg_channels[m_.strip()] = slug_.strip().lstrip("@")
         catalog_future = None
-        apify_token = ""
     else:
         log.info("2. Market saytları skan edilir (endirim səhifələri avtomatik tapılır)...")
         web_blocks, structured, socials, tg_channels, web_vision = scrape_market_websites()
@@ -2723,7 +2751,8 @@ def main():
 
     log.info("5. Vision AI və Gemini analizi aparılır...")
     vision_items = extract_from_promo_images_vision(client, web_vision + ig_vision + fb_vision + tg_vision)
-    collect_pdf_catalogs(web_blocks + ig_blocks + fb_blocks + tg_blocks)
+    if not TG_ONLY:   # PDF kataloqlar yalnız köhnə (sayt) rejimində oxunur
+        collect_pdf_catalogs(web_blocks + ig_blocks + fb_blocks + tg_blocks)
     try:
         catalog_items = split_catalog_images(client, today)
     except Exception as exc:
