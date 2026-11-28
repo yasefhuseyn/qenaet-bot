@@ -77,6 +77,9 @@ HEADERS = {
 }
 
 
+TG_ONLY = os.environ.get("TELEGRAM_ONLY", "1").strip() != "0"   # yalnız Telegram/Instagram/Facebook
+
+
 def env_int(name: str, default: int) -> int:
     try:
         return int((os.environ.get(name) or "").strip() or default)
@@ -132,10 +135,10 @@ MARKET_WEBSITES = [
 ]
 
 # Rəsmi saytlardan avtomatik tapılmazsa ehtiyat ünvanlar
-DEFAULT_SOCIAL_URLS = {
-    "Bravo":      {"ig": "https://www.instagram.com/bravosupermarketaz/", "fb": "https://www.facebook.com/BravoSupermarketAz/"},
+DEFAULT_SOCIAL_URLS = {   # istifadəçinin verdiyi rəsmi ünvanlar (2026-11-28)
+    "Bravo":      {"ig": "https://www.instagram.com/bravosupermarketaz/", "fb": "https://www.facebook.com/bravosupermarketaz/"},
     "Araz":       {"ig": "https://www.instagram.com/arazsupermarket/", "fb": "https://www.facebook.com/arazsupermarket/"},
-    "Bazarstore": {"ig": "https://www.instagram.com/bazarstore_supermarket/", "fb": "https://www.facebook.com/bazarstore.az/"},
+    "Bazarstore": {"ig": "https://www.instagram.com/bazarstore_supermarket/", "fb": "https://www.facebook.com/bazarstoresupermarket/"},
     "OBA":        {"ig": "https://www.instagram.com/obamarketler/", "fb": "https://www.facebook.com/obamarket.az/"},
     "AL Market":  {"ig": "https://www.instagram.com/almarketler/", "fb": "https://www.facebook.com/almarketler/"},
     "Rahat":      {"ig": "https://www.instagram.com/rahatmarket.az/", "fb": "https://www.facebook.com/rahatmarket.az/"},
@@ -145,18 +148,7 @@ DEFAULT_SOCIAL_URLS = {
 }
 
 # Facebook səhifələri (rəsmi, 2026-11-26 yoxlanılıb) — saytdan tapılandan üstündür
-VERIFIED_FB = {
-    "Bravo": "https://www.facebook.com/BravoSupermarketAz/",
-    "Araz": "https://www.facebook.com/arazsupermarket/",
-    "Bazarstore": "https://www.facebook.com/bazarstore.az/",
-    "OBA": "https://www.facebook.com/obamarket.az/",
-    "AL Market": "https://www.facebook.com/almarketler/",
-    "Rahat": "https://www.facebook.com/rahatmarket.az/",
-    "Bolmart": "https://www.facebook.com/bolmart.supermarket/",
-    "Grandmart": "https://www.facebook.com/grandmart.supermarket/",
-    "Tamstore": "https://www.facebook.com/tamstoremarket/",
-    "Neptun": "https://www.facebook.com/neptunsupermarketler/",
-}
+VERIFIED_FB = {m: v["fb"] for m, v in DEFAULT_SOCIAL_URLS.items()}
 
 TELEGRAM_CHANNELS = {   # t.me/s/ ilə açılışı yoxlanılıb (2026-11-26)
     "Bravo": "bravosupermarketaze",
@@ -2337,7 +2329,7 @@ def build_products(raw_items: list[dict], prev_items: list[dict], image_cache: d
                 f_ = idx.find(g[0]["name"])
                 if f_:
                     extra_comps.setdefault(hk0, []).append({"market": mk, "price": f_["price"], "isPromo": bool(f_["old"]), "name": clean_text(f_["name"], 90)})
-            elif mk == "Bazarstore":
+            elif mk == "Bazarstore" and not TG_ONLY:
                 todo_old.append((hk0, g))
     if todo_old:   # kataloq alınmayıbsa köhnə üsul: Bazarstore axtarışı
         with ThreadPoolExecutor(max_workers=8) as pool:
@@ -2382,6 +2374,8 @@ def build_products(raw_items: list[dict], prev_items: list[dict], image_cache: d
         if (prev and prev.get("imageUrl") and prev.get("imgSrc") in ("source", "verified", "matched")
                 and (not re.search(r"fbcdn|cdninstagram|scontent", prev["imageUrl"]) or image_alive(prev["imageUrl"]))):
             e["imageUrl"], e["imgSrc"] = prev["imageUrl"], prev["imgSrc"]   # yalnız yoxlanmış şəkil təkrar istifadə olunur
+        elif TG_ONLY:
+            pass   # yalnız paylaşımın öz şəkli; internetdən şəkil axtarılmır
         elif (image_cache.get(e["key"]) or "").startswith("https://"):
             e["imageUrl"], e["imgSrc"] = image_cache[e["key"]], "verified"
         elif similar_image(e):
@@ -2723,7 +2717,6 @@ def main():
     brand_logos = collect_brand_logos(existing_logos, client)
     write_doc(db, "brand_assets", {"updatedLabel": f"Yeniləndi: {now_label}", "version": LOGO_VERSION, "logos": brand_logos, "cards": card_images}, dry)
 
-    TG_ONLY = os.environ.get("TELEGRAM_ONLY", "1").strip() != "0"
     if TG_ONLY:
         log.info("2. YALNIZ sosial mənbələr (Telegram → Instagram → Facebook): saytlar, kataloqlar və PDF-lər ötürülür.")
         web_blocks, structured, web_vision = [], [], []
