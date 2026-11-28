@@ -199,7 +199,8 @@ MARKET_ALIASES = {
     "almarket": "AL Market", "al market": "AL Market", "al-market": "AL Market",
     "grandmart": "Grandmart", "grand mart": "Grandmart", "bolmart": "Bolmart", "bol mart": "Bolmart",
 }
-ALLOWED_CATEGORIES = ("Süd məhsulları", "Ərzaq", "İçkilər", "Təmizlik", "Şirniyyat")
+ALLOWED_CATEGORIES = ("Süd məhsulları", "Ət və quş əti", "Balıq və dəniz məhsulları", "Meyvə və tərəvəz", "Çörək və un məmulatları", "Bakaliya", "İçkilər", "Şirniyyat",
+                      "Qəlyanaltı və qoz-fındıq", "Dondurulmuş məhsullar", "Təmizlik və məişət kimyası", "Şəxsi gigiyena və gözəllik", "Uşaq məhsulları", "Heyvan yemi", "Ev və mətbəx", "Digər")
 PROMO_KEYWORDS = ("endirim", "aksiya", "kampaniya", "special", "promo", "offer", "discount", "kataloq",
                   "catalog", "teklif", "təklif", "sale", "kampaniy")
 PRICE_RE = re.compile(r"\d+(?:[.,]\d{1,2})?\s*(?:₼|azn|man\b|manat)", re.I)
@@ -1126,13 +1127,22 @@ def scrape_market_websites() -> tuple[list[dict], list[dict], dict, dict, list[d
 
 
 # --------------------------------------------------------------------------- saytlara xas çıxarıcılar
-CATEGORY_RULES = [
-    ("Süd məhsulları", ("süd", "sud ", "qatıq", "qatiq", "pendir", "kərə yağ", "kefir", "qaymaq", "yoqurt", "ayran", "kəsmik")),
-    ("İçkilər", ("kola", "cola", "su ", "şirə", "sirə", "içki", "fanta", "limonad", "sprite", "pepsi", "çay", "qəhvə",
-                 "kofe", "nescafe", "enerji", "mineral", "gaz")),
-    ("Təmizlik", ("yuyucu", "sabun", "fairy", "bulaşıq", "təmizl", "ağardıcı", "agardici", "tualet", "kağız", "salfet",
-                  "şampun", "pampers", "dəsmal", "maye", "mayesi")),
-    ("Şirniyyat", ("şokolad", "konfet", "peçenye", "vafli", "tort", "biskvit", "dondurma", "marmelad", "halva", "paxlava")),
+CATEGORY_RULES = [   # sıra vacibdir: dəqiq kateqoriyalar əvvəldə; açar sözlər sadələşdirilmiş (ə→e, ı→i, ö→o, ü→u, ş→s, ç→c, ğ→g) yazılır
+    ("Heyvan yemi", ("it yemi", "pisik yemi", "pisik qidasi", "it qidasi", "whiskas", "pedigree", "kitekat", "felix", "purina", "heyvan yem", "quş yemi", "balig yemi")),
+    ("Uşaq məhsulları", ("usaq", "bebek", "pampers", "huggies", "bebe", "mamasi", "mama ", "uşaq", "carriage", "nan ", "nestogen", "aptamil", "hipp", "memoris", "bez ")),
+    ("Dondurulmuş məhsullar", ("dondurulmus", "donmus", "frozen", "pelmen", "xinkali", "naget", "nugget", "dondurma", "pizza", "dolma donm")),
+    ("Süd məhsulları", ("sud", "qatiq", "pendir", "kere yag", "kefir", "qaymaq", "yoqurt", "yogurt", "ayran", "kesmik", "danone", "activia", "xama", "yumurta", "maqnezyum")),
+    ("Ət və quş əti", ("et ", "toyuq", "qiyme", "kolbasa", "sosis", "sucuq", "vetchina", "vetcina", "dana ", "quzu", "bud ", "kabab", "ciger", "delikates", "salami", "bacon", "bekon", "ordek", "hindusk", "brisket")),
+    ("Balıq və dəniz məhsulları", ("baliq", "qizilbaliq", "som ", "kilka", "skumbriya", "krevet", "ikra", "tuna", "sardina", "karides", "midye", "kalmar", "kutum", "siyenek")),
+    ("Meyvə və tərəvəz", ("alma", "armud", "banan", "portagal", "mandarin", "limon", "uzum", "xiyar", "pomidor", "kartof", "soyan", "sogan", "yerkoku", "kelem", "bibər", "biber", "badimcan", "kivi", "nar ", "heyva", "seftali", "ərik", "erik", "gilas", "albali", "gavali", "qarpiz", "yemis", "meyve", "terevez", "göyərti", "goyerti", "sarimsaq", "mantar", "avokado", "ananas", "xurma", "findiq alma", "limon")),
+    ("Çörək və un məmulatları", ("corek", "lavas", "bulka", "kruasan", "baget", "tandir", "un ", "xemir", "mayasi", "sehriyye", "pirojki", "keks", "sirnik", "yuxa", "tost corek", "lahmacun")),
+    ("Bakaliya", ("duyu", "yarma", "bugda", "mercimek", "lobya", "noxud", "makaron", "spagetti", "seker", "duz ", "yag ", "gunebaxan", "zeytun yag", "yagi", "sirke", "ketcup", "ketchup", "mayonez", "sous", "sous ", "konserv", "bal ", "mürebbe", "murebbe", "pasta", "bulyon", "ədviyyat", "edviyyat", "kakao", "pudra", "vanil", "mayasi", "hazir sorba", "noodle", "doshirak", "fasulye", "qargidali")),
+    ("İçkilər", ("kola", "cola", "su ", "sirə", "sire", "icki", "fanta", "limonad", "sprite", "pepsi", "cay", "qehve", "kofe", "nescafe", "coffee", "enerji", "mineral", "gazli", "kompot", "kvas", "ice tea", "nektar", "sok ", "juice", "olimpik", "badamli", "pivə", "pive", "sarab", "araq", "vodka", "viski", "konyak", "shampan", "sampan", "şərab")),
+    ("Şirniyyat", ("sokolad", "konfet", "pecenye", "vafli", "tort", "biskvit", "marmelad", "halva", "paxlava", "snickers", "twix", "mars ", "bounty", "kinder", "milka", "alpen", "jele", "zefir", "draje", "naxis", "lokum", "saqqiz", "bar ", "sirniyyat", "sekerleme", "kruvasan sokolad", "nutella", "krem pasta")),
+    ("Qəlyanaltı və qoz-fındıq", ("cips", "chips", "kraker", "sneck", "snack", "findiq", "badam", "qoz ", "pistaci", "fistiq", "kurag", "qurudulmus", "popkorn", "pop corn", "pretzel", "lays", "pringles", "doritos", "cheetos", "susam", "gunebaxan toxum", "toxum")),
+    ("Təmizlik və məişət kimyası", ("yuyucu", "toz ", "gel ", "bulasiq", "temizl", "agardici", "ariel", "persil", "tide", "fairy", "domestos", "comet", "vanish", "lenor", "kondisioner", "yuma", "dezinfeks", "ətir", "hava tazələ", "hava tazele", "rahatlandirici", "mayesi", "maye ", "pakyet", "zibil", "salfet", "tualet kagiz", "kagiz dəsmal", "kagiz desmal", "sunger", "əlcək", "elcek")),
+    ("Şəxsi gigiyena və gözəllik", ("sampun", "shampoo", "sabun", "dis pastasi", "dis fircasi", "diş", "deodorant", "krem", "losyon", "ustara", "tiraş", "tiras", "gigiyenik", "prokladka", "always", "libresse", "tampon", "pomada", "boya", "lak ", "parfum", "odekolon", "dus geli", "maska", "serum", "nivea", "dove", "head shoulders", "pantene", "colgate", "oral-b", "gillette", "pambiq", "qulaq cubugu", "islak desmal", "salfet islak")),
+    ("Ev və mətbəx", ("qab ", "qazan", "tava", "bicaq", "qasiq", "stakan", "fincan", "termos", "qapaq", "ev ucun", "mətbəx", "metbex", "tekstil", "yorgan", "balis", "carsaf", "xalca", "lampa", "batareya", "ampul", "uzadici", "kabel", "alətlər", "aletler", "oyuncaq", "kitab", "dəftər", "defter", "qələm", "qelem", "paltar", "corab", "ayaqqabi", "terlik", "geyim", "elektrik", "çaydan", "caydan", "ütü", "utu", "blender", "mikser", "bisiricisi", "tozsoran", "televizor", "qizdirici", "fen ", "tost aparati", "mebel", "plastik", "yeşik", "yesik")),
 ]
 UNIT_RE = re.compile(r"(\d+(?:[.,]\d+)?\s?(?:kq|kg|qr|gr|ml|litr|lt|ədəd|əd)\b|\d+(?:[.,]\d+)?\s?[lLqQgG]\b|\bKQ\b)", re.I)
 BAD_IMG_RE = re.compile(r"logo|icon|favicon|sprite|flag|avatar|arrow|header|footer|wolt|facebook\.com/tr|yandex|linkedin|"
@@ -1154,12 +1164,21 @@ def tr_title(text: str) -> str:
     return " ".join(words)
 
 
+_FOLD_MAP = str.maketrans({"ə": "e", "ı": "i", "ö": "o", "ü": "u", "ş": "s", "ç": "c", "ğ": "g", "Ə": "e", "İ": "i", "I": "i", "Ö": "o", "Ü": "u", "Ş": "s", "Ç": "c", "Ğ": "g"})
+
+
+def _cat_fold(text: str) -> str:
+    return " " + re.sub(r"\s+", " ", (text or "").translate(_FOLD_MAP).lower()) + " "
+
+
 def guess_category(name: str) -> str:
-    low = (name or "").lower() + " "
+    low = _cat_fold(name)
     for cat, kws in CATEGORY_RULES:
-        if any(k in low for k in kws):
-            return cat
-    return "Ərzaq"
+        for k in kws:
+            kf = k.translate(_FOLD_MAP).lower()
+            if (kf.endswith(" ") and (" " + kf) in low) or (not kf.endswith(" ") and kf in low):
+                return cat
+    return "Digər"
 
 
 def guess_unit(name: str) -> str:
@@ -2155,9 +2174,11 @@ def clean_item(it: dict, today: str) -> dict | None:
     start_date = str(it.get("startDate") or "").strip()[:10]
     if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", start_date) or (end_date and start_date > end_date):
         start_date = ""
-    cat = clean_text(it.get("category"), 30)
-    if cat not in ALLOWED_CATEGORIES or cat == "Ərzaq":
-        cat = guess_category(name) if cat in ("", "Ərzaq") or cat not in ALLOWED_CATEGORIES else cat
+    cat = guess_category(name)   # qaydalarla (Gemini-yə güvənmədən) hər məhsula kateqoriya təyin olunur
+    if cat == "Digər":
+        g_cat = clean_text(it.get("category"), 30)
+        if g_cat in ALLOWED_CATEGORIES:
+            cat = g_cat
     key = normalize_key(name)
     if not key:
         return None
