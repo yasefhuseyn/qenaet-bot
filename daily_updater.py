@@ -96,7 +96,7 @@ VISION_PER_CALL = 4        # bir Gemini sorğusunda neçə şəkil oxunsun
 VISION_PER_MARKET = 10     # hər saytdan maksimum promo şəkli
 BAZAR_MAX = env_int("BAZAR_MAX_PRODUCTS", 240)
 EXTRA_PAGES = env_int("EXTRA_PAGES_PER_MARKET", 3)
-IMAGE_SEARCH_MAX = env_int("IMAGE_SEARCH_MAX", 350)
+IMAGE_SEARCH_MAX = env_int("IMAGE_SEARCH_MAX", 700)
 CATALOG_MAX_IMAGES = env_int("CATALOG_MAX_IMAGES", 60)     # bir işləmədə kəsilən kataloq şəkli sayı
 CATALOG_MAX_CROPS = env_int("CATALOG_MAX_CROPS", 250)       # bir işləmədə kəsilən məhsul şəkli sayı
 CROP_DIR = "product_images"
@@ -114,7 +114,7 @@ BAZAR_LOOKUP_MAX = env_int("BAZAR_LOOKUP_MAX", 300)
 VERIFY_MAX = env_int("VISION_VERIFY_MAX", 250)   # axtarışla tapılan şəkilləri AI ilə yoxlama limiti
 NEG_CACHE_DAYS = 2        # uyğun şəkil tapılmayan məhsul bu müddət təkrar axtarılmır
 _verify_used = 0
-IMAGE_BUDGET_SEC = env_int("IMAGE_BUDGET_SEC", 2400)   # şəkil axtarışı üçün ümumi vaxt limiti
+IMAGE_BUDGET_SEC = env_int("IMAGE_BUDGET_SEC", 3600)   # şəkil axtarışı üçün ümumi vaxt limiti
 _img_started = 0.0
 
 WATERMARK_DOMAINS = (
@@ -2070,14 +2070,13 @@ def extract_from_promo_images_vision(client, candidates: list[dict]) -> list[dic
                     if isinstance(idx, int) and 1 <= idx <= len(loaded):
                         item["_img"] = loaded[idx - 1][0]
                     layout = str(item.pop("layout", "") or "").lower()
-                    if not (layout == "single" and per_img.get(idx) == 1 and isinstance(idx, int)
-                            and 1 <= idx <= len(loaded)):
+                    is_single = (layout == "single" and per_img.get(idx) == 1 and isinstance(idx, int) and 1 <= idx <= len(loaded))
+                    if not is_single:
+                        # kollaj/kataloq: ad+qiymət saxlanılır, şəkil sonradan internetdən tapılır (kəsmə yoxdur)
                         STATS["catalog_skipped"] = STATS.get("catalog_skipped", 0) + 1
-                        if isinstance(idx, int) and 1 <= idx <= len(loaded):
-                            cu = loaded[idx - 1][0]
-                            if all(c["url"] != cu for c in CATALOG_IMAGES):
-                                CATALOG_IMAGES.append({"market": market, "source": source, "url": cu})
-                        continue   # kataloq şəkli bütöv olaraq istifadə olunmur, aşağıda hissələrə bölünür
+                        item["imageUrl"], item["imgSrc"] = "", ""
+                        extracted.append(item)
+                        continue
                     item["imageUrl"] = loaded[idx - 1][0]   # paylaşımın öz şəkli = məhsulun şəkli
                     item["imgSrc"] = "source"
                     STATS["single_photo"] = STATS.get("single_photo", 0) + 1
@@ -2782,7 +2781,7 @@ def main():
     if not TG_ONLY:   # PDF kataloqlar yalnız köhnə (sayt) rejimində oxunur
         collect_pdf_catalogs(web_blocks + ig_blocks + fb_blocks + tg_blocks)
     try:
-        catalog_items = split_catalog_images(client, today)
+        catalog_items = []   # kollaj məhsulları artıq Vision mərhələsində oxunur (əlavə Gemini sorğusu lazım deyil)
     except Exception as exc:
         log.warning("  [Kataloq bölmə] ötürüldü: %s", str(exc)[:160])
         catalog_items = []
