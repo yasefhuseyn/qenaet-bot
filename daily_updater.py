@@ -109,10 +109,10 @@ GEMINI_BATCH_CHARS = 22000
 GEMINI_MAX_BATCHES = 4
 GEMINI_MIN_INTERVAL = 4.0  # saniyə (pulsuz limitə uyğun)
 LOGO_VERSION = 4           # dəyişəndə bütün loqolar yenidən yoxlanılır
-IMAGE_CACHE_VERSION = 2    # dəyişəndə köhnə (yanlış ola bilən) şəkil keşi silinir
+IMAGE_CACHE_VERSION = 3    # dəyişəndə köhnə (yanlış ola bilən) şəkil keşi silinir
 BAZAR_LOOKUP_MAX = env_int("BAZAR_LOOKUP_MAX", 300)
 VERIFY_MAX = env_int("VISION_VERIFY_MAX", 250)   # axtarışla tapılan şəkilləri AI ilə yoxlama limiti
-NEG_CACHE_DAYS = 14        # uyğun şəkil tapılmayan məhsul bu müddət təkrar axtarılmır
+NEG_CACHE_DAYS = 2        # uyğun şəkil tapılmayan məhsul bu müddət təkrar axtarılmır
 _verify_used = 0
 IMAGE_BUDGET_SEC = env_int("IMAGE_BUDGET_SEC", 2400)   # şəkil axtarışı üçün ümumi vaxt limiti
 _img_started = 0.0
@@ -1783,85 +1783,42 @@ def download_image_bytes(url: str):
 
 
 def split_catalog_images(client, today: str) -> list[dict]:
-    """Kataloq şəklini məhsul-məhsul kəsir: Gemini çərçivə + ad + qiymət verir, kəsilmiş şəkil ikinci oxumayla təsdiqlənir,
-    təsdiqlənənlər product_images/ qovluğuna yazılır (workflow onları repoya yükləyir, raw linklə göstərilir)."""
-    os.makedirs(CROP_DIR, exist_ok=True)
-    out, crops_total = [], 0
+    """Kataloq/kollaj şəklindən məhsulların adını və qiymətini oxuyur. Kəsilmiş şəkil İSTİFADƏ OLUNMUR (keyfiyyətsizdir):
+    şəkil sonradan internetdən axtarılır."""
+    out = []
     for cat in CATALOG_IMAGES[:CATALOG_MAX_IMAGES]:
-        if crops_total >= CATALOG_MAX_CROPS:
-            break
         raw = cat.get("bytes") or download_image_bytes(cat["url"])
         if not raw:
             continue
         try:
-            img = Image.open(io.BytesIO(raw)).convert("RGB")
+            Image.open(io.BytesIO(raw)).verify()
         except Exception:
             continue
-        W, H = img.size
-        if W < 700 or H < 700:
-            continue   # çox kiçik kataloq: kəsilən hissələr bulanıq olar
-        mime = "image/jpeg"
-        part = types.Part.from_bytes(data=raw, mime_type=mime) if types is not None else None
+        part = types.Part.from_bytes(data=raw, mime_type="image/jpeg") if types is not None else None
         prompt = (
-            f"Bu {cat['market']} marketinin endirim kataloq şəklidir. Qiyməti (AZN / ₼) aydın görünən HƏR məhsulu ayrıca tap. "
+            f"Bu {cat['market']} marketinin endirim kataloqu / kollaj şəklidir. Qiyməti (AZN / ₼) aydın görünən HƏR məhsulu ayrıca oxu. "
             "YALNIZ JSON massivi qaytar: "
-            '[{"name": "marka və həcm/çəki ilə tam ad", "oldPrice": 3.5, "price": 2.49, "unit": "1 ədəd", '
-            '"box": [ymin, xmin, ymax, xmax]}]. '
-            "box — yalnız həmin məhsulun öz şəklini (qutu/paket/şüşə) əhatə edən çərçivə, 0-1000 miqyasında "
-            "(şəklin eni və hündürlüyünə nisbətən); qiymət etiketi və başqa məhsullar çərçivəyə düşməsin. "
-            "Qiyməti və ya aydın şəkli olmayan məhsulu yazma. Heç nə uydurma."
+            '[{"name": "marka və həcm/çəki ilə tam ad", "oldPrice": 3.5, "price": 2.49, "unit": "1 ədəd", "percent": 20, "endDate": "2026-12-31"}]. '
+            "Üstündən xətt çəkilmiş rəqəm köhnə qiymət, qırmızı/vurğulanmış rəqəm yeni endirimli qiymətdir; böyük rəqəm manat, kiçik yuxarı rəqəm qəpikdir. "
+            "Kart-üzvü ('OBA Plus', 'üzvlərinə') qiymətini price kimi yazma. Faiz yazılıbsa percent yaz. endDate yalnız şəkildə bu endirim üçün yazılıbsa (YYYY-MM-DD). "
+            "Qiyməti aydın olmayan məhsulu yazma. Heç nə uydurma."
         )
         try:
-            rows = [x for x in extract_json_array(gemini_text(client, [prompt, part]))
-                    if isinstance(x, dict) and x.get("name") and x.get("price") and isinstance(x.get("box"), list) and len(x["box"]) == 4]
+            rows = [x for x in extract_json_array(gemini_text(client, [prompt, part])) if isinstance(x, dict) and x.get("name") and x.get("price")]
         except Exception as exc:
             log.warning("  [Kataloq bölmə xətası] %s: %s", cat["market"], str(exc)[:120])
             continue
-        crops = []
-        for r in rows[:14]:
-            try:
-                y0, x0, y1, x1 = [max(0.0, min(1000.0, float(v))) for v in r["box"]]
-            except Exception:
+        for r in rows[:40]:
+            pr, op, pc = safe_float(r.get("price"), 0) or 0, safe_float(r.get("oldPrice"), 0) or 0, safe_float(r.get("percent"), 0) or 0
+            if pr <= 0 or (op and pr >= op):
                 continue
-            box = (int(x0 * W / 1000), int(y0 * H / 1000), int(x1 * W / 1000), int(y1 * H / 1000))
-            if box[2] - box[0] < 150 or box[3] - box[1] < 150:
-                continue   # çox kiçikdir — keyfiyyətsiz olar
-            crop = img.crop(box)
-            crops.append((r, crop))
-        if not crops:
-            continue
-        # İkinci, müstəqil oxuma: kəsilmiş şəkillər
-        parts = []
-        for _, c in crops:
-            buf = io.BytesIO()
-            c.save(buf, "JPEG", quality=88)
-            parts.append(types.Part.from_bytes(data=buf.getvalue(), mime_type="image/jpeg"))
-        listing = "\n".join(f"{i + 1}. ad: {r['name']} | qiymət: {r['price']} AZN" for i, (r, _) in enumerate(crops))
-        prompt2 = (
-            "Sənə nömrələnmiş kəsilmiş şəkillər verilir (verilmə sırası ilə). Hər biri üçün yoxla: (a) şəkildə YALNIZ BİR məhsul var; "
-            "(b) şəkil aydın və kəskindir (bulanıq deyil, kəsilməyib); (c) aşağıdakı ad və qiymət məhz bu məhsula aiddir "
-            "(qiymət yazısı şəkildə görünürsə uyğun olmalıdır).\n" + listing + "\n"
-            'YALNIZ JSON massivi: [{"n": 1, "ok": true}]. Şübhə varsa ok=false.'
-        )
-        try:
-            verdict = extract_json_array(gemini_text(client, [prompt2] + parts))
-        except Exception as exc:
-            log.warning("  [Kataloq təsdiq xətası] %s", str(exc)[:120])
-            continue
-        ok_idx = {v["n"] - 1 for v in verdict if isinstance(v, dict) and v.get("ok") is True and isinstance(v.get("n"), int)}
-        for i, (r, c) in enumerate(crops):
-            if i not in ok_idx:
-                STATS["crop_rejected"] = STATS.get("crop_rejected", 0) + 1
+            if op and pc and abs(op * (1 - pc / 100.0) - pr) > max(0.06, pr * 0.03):
+                STATS["price_rejected"] = STATS.get("price_rejected", 0) + 1
                 continue
-            c.thumbnail((600, 600))
-            fname = hashlib.sha1((cat["url"] + str(r["box"])).encode()).hexdigest()[:14] + ".jpg"
-            c.save(os.path.join(CROP_DIR, fname), "JPEG", quality=85)
-            item = {"name": r["name"], "price": r["price"], "oldPrice": r.get("oldPrice"), "unit": r.get("unit") or "1 ədəd",
-                    "category": "Ərzaq", "market": cat["market"], "source": cat["source"] + " (kataloq)",
-                    "imageUrl": CROP_RAW_BASE + fname, "imgSrc": "source"}
-            out.append(item)
-            crops_total += 1
-    log.info("  [Kataloq bölmə] %d şəkildən %d məhsul təsdiqləndi, %d rədd edildi", len(CATALOG_IMAGES[:CATALOG_MAX_IMAGES]), len(out), STATS.get("crop_rejected", 0))
+            out.append({"name": r["name"], "price": pr, "oldPrice": op or None, "unit": r.get("unit") or "1 ədəd",
+                        "category": "Ərzaq", "market": cat["market"], "source": cat["source"] + " (kataloq)",
+                        "endDate": r.get("endDate") or "", "imageUrl": "", "imgSrc": ""})
+    log.info("  [Kataloq bölmə] %d şəkildən %d məhsul (ad+qiymət) oxundu", len(CATALOG_IMAGES[:CATALOG_MAX_IMAGES]), len(out))
     return out
 
 
@@ -2203,6 +2160,7 @@ def clean_item(it: dict, today: str) -> dict | None:
     raw_end = str(it.get("endDate") or "").strip()[:10]
     if re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw_end):
         if raw_end < today:
+            STATS["expired_dropped"] = STATS.get("expired_dropped", 0) + 1
             return None  # bitmiş endirim
         end_date = raw_end
     start_date = str(it.get("startDate") or "").strip()[:10]
@@ -2441,6 +2399,9 @@ def build_products(raw_items: list[dict], prev_items: list[dict], image_cache: d
             if url:
                 e["imageUrl"], e["imgSrc"] = url, "verified"
             searched += 1
+
+    log.info("  Şəkilsiz qalan məhsul: %d / %d (internetdən tapılan: %d, axtarış: %d)", sum(1 for e in entry_list if not e["imageUrl"]), len(entry_list),
+             sum(1 for e in entry_list if e.get("imgSrc") == "verified"), searched)
 
     # 6. Yekun siyahı
     products, drops = [], []
