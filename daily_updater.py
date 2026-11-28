@@ -1546,7 +1546,12 @@ def apify_run(actor: str, token: str, payload: dict, label: str) -> list:
         if r.status_code in (200, 201):
             data = r.json()
             return data if isinstance(data, list) else []
-        log.error("  [Apify %s xəta] HTTP %s: %s", label, r.status_code, r.text[:200])
+        try:
+            _j = r.json().get("error", {})
+            _msg = f"{_j.get('type','')} / {str(_j.get('message',''))[:150]}"
+        except Exception:
+            _msg = "cavab oxunmadı, uzunluq %d" % len(r.text)
+        log.error("  [Apify %s xəta] HTTP %s | %s", label, r.status_code, _msg.replace(token, "<token>") if token else _msg)
         if r.status_code in (400, 401, 402, 403):   # təkrar cəhdin mənası yoxdur (kredit/icazə problemi)
             return None
         raise RuntimeError(f"HTTP {r.status_code}")
