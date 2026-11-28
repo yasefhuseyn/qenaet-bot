@@ -1859,8 +1859,15 @@ _NOISE_WORDS = re.compile(r"\b(endirim\w*|aksiya\w*|yalnız|qiymət\w*|günün|t
 def parse_end_date(text: str) -> str:
     """'26-30 noyabr' / '30 noyabrdək' kimi yazıdan bitmə tarixini (YYYY-MM-DD) çıxarır."""
     low = (text or "").lower()
-    m = re.search(r"(\d{1,2})\s*[-–—]\s*(\d{1,2})\s*(" + _MONTH_RE + r")", low) or \
-        re.search(r"()(\d{1,2})\s*(" + _MONTH_RE + r")", low)
+    m = re.search(r"(\d{1,2})\s*[-–—]\s*(\d{1,2})\s*(" + _MONTH_RE + r")", low)
+    if not m:
+        singles = re.findall(r"()(\d{1,2})\s*(" + _MONTH_RE + r")", low)
+        m = None
+        if singles:
+            class _M:   # bir neçə tarix varsa (başlama + bitmə) sonuncusu bitmə tarixidir
+                def __init__(self, g): self.g = g
+                def group(self, i): return self.g[i - 1]
+            m = _M(singles[-1])
     if not m:
         return ""
     day, month = int(m.group(2)), AZ_MONTHS[m.group(3)]
