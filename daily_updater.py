@@ -89,7 +89,7 @@ def env_int(name: str, default: int) -> int:
 
 IG_POSTS = env_int("IG_POSTS_PER_PAGE", 10)
 FB_POSTS = env_int("FB_POSTS_PER_PAGE", 12)
-TG_PAGES = env_int("TG_PAGES_PER_CHANNEL", 10)   # hər səhifədə ~20 paylaşım
+TG_PAGES = env_int("TG_PAGES_PER_CHANNEL", 25)   # hər səhifədə ~20 paylaşım
 TG_POSTS = env_int("TG_POSTS_PER_CHANNEL", 30)
 VISION_MAX = env_int("VISION_MAX_IMAGES", 400)
 VISION_PER_CALL = 4        # bir Gemini sorğusunda neçə şəkil oxunsun
@@ -103,7 +103,7 @@ CROP_DIR = "product_images"
 CROP_RAW_BASE = "https://raw.githubusercontent.com/yasefhuseyn/qenaet-bot/main/" + CROP_DIR + "/"
 CATALOG_IMAGES: list[dict] = []   # vision zamanı "kataloq" kimi tanınan şəkillər
 MAX_PRODUCTS = 600
-MAX_AGE_DAYS = 14          # bundan köhnə sosial şəbəkə paylaşımları atılır
+MAX_AGE_DAYS = 21          # bundan köhnə sosial şəbəkə paylaşımları atılır
 MIN_PRICE, MAX_PRICE = 0.05, 300.0
 GEMINI_BATCH_CHARS = 22000
 GEMINI_MAX_BATCHES = 4
@@ -1646,19 +1646,25 @@ def scrape_one_telegram(market: str, slug: str) -> tuple[list[dict], list[dict]]
             any_recent = True
             txt_el = wrap.select_one(".tgme_widget_message_text")
             text = txt_el.get_text(" ", strip=True) if txt_el else ""
-            img = ""
-            photo = wrap.select_one(".tgme_widget_message_photo_wrap")
-            if photo and photo.get("style"):
-                m = re.search(r"url\(['\"]?(https?://[^'\")]+)", photo["style"])
-                if m:
-                    img = m.group(1)
+            imgs = []
+            for el in wrap.select(".tgme_widget_message_photo_wrap, .tgme_widget_message_video_thumb, "
+                                  ".tgme_widget_message_roundvideo_thumb, .link_preview_image, .link_preview_right_image, "
+                                  ".tgme_widget_message_link_preview .link_preview_image"):
+                m = re.search(r"url\(['\"]?(https?://[^'\")]+)", el.get("style") or "")
+                if m and m.group(1) not in imgs:
+                    imgs.append(m.group(1))
+            for el in wrap.select("img"):
+                src = el.get("src") or ""
+                if src.startswith("http") and src not in imgs and not any(x in src for x in ("emoji", "userpic", "avatar")):
+                    imgs.append(src)
+            img = imgs[0] if imgs else ""
             STATS["tg_posts"] += 1
             total += 1
             cap_text = txt_el.get_text("\n", strip=True) if txt_el else ""
             if len(text) > 15:
                 posts.append({"text": text[:500], "imageUrl": img})
-            if img:
-                vision.append({"market": market, "source": "Telegram kanalı", "imageUrl": img, "caption": cap_text[:700]})
+            for im in imgs[:6]:
+                vision.append({"market": market, "source": "Telegram kanalı", "imageUrl": im, "caption": cap_text[:700]})
         if not any_recent or not ids or min(ids) <= 1:
             break
         nb = min(ids)
